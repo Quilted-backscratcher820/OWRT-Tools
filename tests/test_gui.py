@@ -25,7 +25,7 @@ class GuiStateTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def test_version_backup_gate_and_plugin_rows(self) -> None:
-        self.assertEqual(__version__, "3.0")
+        self.assertEqual(__version__, "4.0")
         window = MainWindow(Path.cwd())
         window.startup_timer.stop()
         window.resize(900, 720)
