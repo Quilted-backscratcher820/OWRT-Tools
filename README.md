@@ -176,7 +176,7 @@ axonhub luci-app-axonhub
 
 ```text
 源码浅克隆（添加项目时）
-更新并安装 feeds（添加项目时；跨日期构建时在初始 defconfig 和 clean 后再次执行）
+更新并安装 feeds（添加项目时；跨日期构建时在初始 defconfig 后、clean 前再次执行）
 自动应用匹配工具链
 下载和去重自定义插件
 生成编译元数据与预编译包集成项
