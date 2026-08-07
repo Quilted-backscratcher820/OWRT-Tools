@@ -157,35 +157,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
+          RELEASE_ARCHIVE: ${{ steps.package.outputs.archive }}
           RELEASE_TAG: ${{ steps.package.outputs.tag }}
           RELEASE_VERSION: ${{ steps.package.outputs.version }}
         run: |
           set -euo pipefail
-
-          {
-            printf 'OWRT Tools %s\n\n' "$RELEASE_VERSION"
-            printf '由 main 分支提交 %s 自动生成。\n\n' "$GITHUB_SHA"
-            printf '下载 %s 并解压即可使用；SHA256SUMS 用于校验文件完整性。\n' "$ARCHIVE"
-          } > RELEASE_NOTES.md
-
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$ARCHIVE" SHA256SUMS \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
-            gh release edit "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "OWRT Tools $RELEASE_VERSION" \
-              --notes-file RELEASE_NOTES.md \
-              --latest
-          else
-            gh release create "$RELEASE_TAG" "$ARCHIVE" SHA256SUMS \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "OWRT Tools $RELEASE_VERSION" \
-              --notes-file RELEASE_NOTES.md \
-              --latest
-          fi
 
           while IFS= read -r old_tag; do
             if [[ -n "$old_tag" && "$old_tag" != "$RELEASE_TAG" ]]; then
@@ -200,13 +176,45 @@ jobs:
               --jq '.[].tag_name'
           )
 
-          mapfile -t remaining_tags < <(
-            gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq '.[].tag_name'
-          )
+          {
+            printf 'OWRT Tools %s\n\n' "$RELEASE_VERSION"
+            printf '由 main 分支提交 %s 自动生成。\n\n' "$GITHUB_SHA"
+            printf '下载 %s 并解压即可使用；SHA256SUMS 用于校验文件完整性。\n' "$RELEASE_ARCHIVE"
+          } > RELEASE_NOTES.md
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$RELEASE_ARCHIVE" SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OWRT Tools $RELEASE_VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" "$RELEASE_ARCHIVE" SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "OWRT Tools $RELEASE_VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          fi
+
+          remaining_tags=()
+          for attempt in {1..15}; do
+            mapfile -t remaining_tags < <(
+              gh api --paginate \
+                "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+                --jq '.[].tag_name'
+            )
+            if (( ${#remaining_tags[@]} == 1 )); then
+              break
+            fi
+            printf '等待 GitHub 发布列表同步（第 %s 次）...\n' "$attempt" >&2
+            sleep 2
+          done
           if (( ${#remaining_tags[@]} != 1 )); then
-            echo "发布清理后数量不是 1：${#remaining_tags[@]}" >&2
+            echo "发布完成后数量不是 1：${#remaining_tags[@]}" >&2
             exit 1
           fi
           if [[ "${remaining_tags[0]}" != "$RELEASE_TAG" ]]; then
