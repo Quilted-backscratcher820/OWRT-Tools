@@ -1,0 +1,215 @@
+name: Publish latest release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.repository }}-latest-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Package and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build release package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version=$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          content = Path("core/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'^__version__ = "([^"]+)"$', content, re.MULTILINE)
+          if match is None:
+              raise SystemExit("无法读取 core.__version__")
+          print(match.group(1))
+          PY
+          )
+          if [[ ! "$version" =~ ^[0-9]+([.][0-9]+)*([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "无效版本号：$version" >&2
+            exit 1
+          fi
+
+          archive="OWRT-Tools-${version}.zip"
+          tag="v${version}-${GITHUB_SHA::7}"
+
+          python3 - "$archive" <<'PY'
+          from pathlib import Path, PurePosixPath
+          import subprocess
+          import sys
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          archive_path = Path(sys.argv[1])
+          selected = subprocess.check_output(
+              (
+                  "git",
+                  "ls-files",
+                  "-z",
+                  "--",
+                  "LICENSE",
+                  "README.md",
+                  "core",
+                  "support",
+                  "run_owrt_linux.desktop",
+                  "run_owrt_linux.sh",
+                  "run_owrt_windows_wsl2.cmd",
+              )
+          )
+          paths = sorted(
+              Path(item.decode("utf-8"))
+              for item in selected.split(b"\0")
+              if item
+          )
+          if not paths:
+              raise SystemExit("发布文件清单为空")
+
+          with ZipFile(
+              archive_path,
+              "w",
+              compression=ZIP_DEFLATED,
+              compresslevel=9,
+          ) as package:
+              for path in paths:
+                  if path.is_symlink() or not path.is_file():
+                      raise SystemExit(f"发布文件不是普通文件：{path}")
+                  destination = (PurePosixPath("OWRT-Tools") / path.as_posix()).as_posix()
+                  package.write(path, destination)
+
+          required = {
+              "OWRT-Tools/LICENSE",
+              "OWRT-Tools/README.md",
+              "OWRT-Tools/run_owrt_linux.desktop",
+              "OWRT-Tools/run_owrt_linux.sh",
+              "OWRT-Tools/run_owrt_windows_wsl2.cmd",
+              "OWRT-Tools/support/wsl_bridge.cmd",
+          }
+          with ZipFile(archive_path) as package:
+              names = set(package.namelist())
+              missing = sorted(required - names)
+              if missing:
+                  raise SystemExit("发布包缺少文件：" + " ".join(missing))
+              forbidden = sorted(
+                  name
+                  for name in names
+                  if name.startswith(
+                      (
+                          "OWRT-Tools/.github/",
+                          "OWRT-Tools/backup_",
+                          "OWRT-Tools/logs/",
+                          "OWRT-Tools/others/",
+                          "OWRT-Tools/projects/",
+                          "OWRT-Tools/tests/",
+                          "OWRT-Tools/toolchains/",
+                      )
+                  )
+                  or "/__pycache__/" in name
+                  or name.endswith((".pyc", ".pyo"))
+              )
+              if forbidden:
+                  raise SystemExit("发布包包含排除项：" + " ".join(forbidden))
+              for name in (
+                  "OWRT-Tools/run_owrt_windows_wsl2.cmd",
+                  "OWRT-Tools/support/wsl_bridge.cmd",
+              ):
+                  if b"\r\n" not in package.read(name):
+                      raise SystemExit(f"CMD 文件不是 CRLF：{name}")
+              for name in (
+                  "OWRT-Tools/run_owrt_linux.desktop",
+                  "OWRT-Tools/run_owrt_linux.sh",
+                  "OWRT-Tools/support/install.sh",
+                  "OWRT-Tools/support/restore_permissions.sh",
+                  "OWRT-Tools/support/run_gui.sh",
+                  "OWRT-Tools/support/system_setup.sh",
+              ):
+                  mode = package.getinfo(name).external_attr >> 16
+                  if mode & 0o111 == 0:
+                      raise SystemExit(f"发布包丢失执行权限：{name}")
+              broken = package.testzip()
+              if broken is not None:
+                  raise SystemExit(f"发布包 CRC 校验失败：{broken}")
+          PY
+
+          sha256sum "$archive" > SHA256SUMS
+          {
+            echo "archive=$archive"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish newest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          {
+            printf 'OWRT Tools %s\n\n' "$RELEASE_VERSION"
+            printf '由 main 分支提交 %s 自动生成。\n\n' "$GITHUB_SHA"
+            printf '下载 %s 并解压即可使用；SHA256SUMS 用于校验文件完整性。\n' "$ARCHIVE"
+          } > RELEASE_NOTES.md
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ARCHIVE" SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OWRT Tools $RELEASE_VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" "$ARCHIVE" SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "OWRT Tools $RELEASE_VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          fi
+
+          while IFS= read -r old_tag; do
+            if [[ -n "$old_tag" && "$old_tag" != "$RELEASE_TAG" ]]; then
+              gh release delete "$old_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --cleanup-tag \
+                --yes
+            fi
+          done < <(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[].tag_name'
+          )
+
+          mapfile -t remaining_tags < <(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[].tag_name'
+          )
+          if (( ${#remaining_tags[@]} != 1 )); then
+            echo "发布清理后数量不是 1：${#remaining_tags[@]}" >&2
+            exit 1
+          fi
+          if [[ "${remaining_tags[0]}" != "$RELEASE_TAG" ]]; then
+            echo "保留的发布不是当前提交：${remaining_tags[0]}" >&2
+            exit 1
+          fi

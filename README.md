@@ -31,6 +31,12 @@
 
 自动依赖安装目前只支持带有 `apt-get` 的 Debian、Ubuntu 和 WSL2 环境。其他 Linux 发行版可以参考 [`support/dependencies.txt`](support/dependencies.txt) 手动准备依赖，但不属于当前支持范围。
 
+## 下载发布包
+
+不熟悉 Git 的用户可以直接打开 [最新版本下载页面](https://github.com/VIKINGYFY/OWRT-Tools/releases/latest)，下载 `OWRT-Tools-版本号.zip` 并解压。压缩包内已经包含 Linux、Linux 桌面和 Windows WSL2 入口，不需要下载 GitHub 自动生成的 Source code 压缩包。
+
+每次 `main` 分支出现新提交后，GitHub Actions 会自动重新打包并发布，同时生成 `SHA256SUMS`。发布页面始终只保留最新一份自动发布及其标签。
+
 ## 快速开始
 
 ### Linux 或 WSL2 终端
