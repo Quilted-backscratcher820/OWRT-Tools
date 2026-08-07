@@ -10,13 +10,34 @@ from core.models import BuildSpec, ProjectSpec
 from core.workflow import Workflow
 
 
+FORCED_CONFIG_TEXT = (
+    Path(__file__).parents[1] / "support" / "forced_config.txt"
+).read_text(encoding="utf-8")
+
+
+def prepare_build_tree(root: Path, project: Path) -> None:
+    support = root / "support"
+    support.mkdir(parents=True, exist_ok=True)
+    (support / "forced_config.txt").write_text(FORCED_CONFIG_TEXT, encoding="utf-8")
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    feeds = scripts / "feeds"
+    feeds.write_text(
+        "#!/bin/sh\n"
+        "test -f defconfig.marker\n"
+        "test -f clean.marker\n"
+        "printf '%s\\n' \"$*\" >> feeds.calls\n",
+        encoding="ascii",
+    )
+    feeds.chmod(0o755)
+
+
 class BuildWorkflowTests(unittest.TestCase):
     def test_custom_script_build_id_and_custom_log_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             project_dir = root / "project"
-            (project_dir / "scripts").mkdir(parents=True)
-            (project_dir / "scripts" / "feeds").write_text("#!/bin/sh\n", encoding="ascii")
+            prepare_build_tree(root, project_dir)
             status_js = (
                 project_dir
                 / "feeds"
@@ -33,10 +54,12 @@ class BuildWorkflowTests(unittest.TestCase):
 .PHONY: defconfig download clean all
 defconfig:
 	@test -f .config
+	@touch defconfig.marker
 download:
 	@:
 clean:
-	@:
+	@test -f defconfig.marker
+	@touch clean.marker
 all:
 	@mkdir -p bin/targets/fixture
 	@touch bin/targets/fixture/firmware.bin
@@ -48,6 +71,7 @@ all:
                 b"#!/bin/bash\r\n"
                 b"printf '%s\\n' \"$WRT_MARK|$WRT_DATE|$WRT_NAME\" > script-env.txt\r\n"
                 b"printf 'CONFIG_PACKAGE_scripted=y\\n' >> .config\r\n"
+                b"printf 'CONFIG_CCACHE=n\\n' >> .config\r\n"
             )
             project = ProjectSpec(
                 "fixture", "https://github.com/example/fixture.git", "main", project_dir
@@ -66,7 +90,10 @@ all:
                 build_id="OWRT-Tools-20990102-030405",
                 backup_enabled=False,
             )
-            with patch("core.workflow.timestamp", return_value="20990102-030405"):
+            with (
+                patch("core.workflow.timestamp", return_value="20990102-030405"),
+                patch("core.workflow.current_date", return_value="20990102"),
+            ):
                 workflow.build(project, spec)
                 workflow.build(project, spec)
 
@@ -89,8 +116,18 @@ all:
                 build_id_file.read_text(encoding="ascii").strip(),
                 "OWRT-Tools-20990102-030405",
             )
+            final_config = sorted(
+                (project_dir / ".builder" / "configs").glob("*/final.config")
+            )[-1].read_text(encoding="utf-8")
+            self.assertEqual(final_config.count("CONFIG_CCACHE="), 1)
+            self.assertIn("CONFIG_CCACHE=y\n", final_config)
+            self.assertNotIn("CONFIG_CCACHE=n", final_config)
             logs = sorted(log_root.glob("log-x86_64-*.txt"))
             self.assertEqual(len(logs), 2)
+            self.assertEqual(
+                (project_dir / "feeds.calls").read_text(encoding="ascii").splitlines(),
+                ["update -a", "install -a"],
+            )
             for line in logs[-1].read_text(encoding="utf-8").splitlines():
                 self.assertRegex(line, r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ")
 
@@ -98,8 +135,7 @@ all:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             project_dir = root / "projects" / "fixture"
-            (project_dir / "scripts").mkdir(parents=True)
-            (project_dir / "scripts" / "feeds").write_text("#!/bin/sh\n", encoding="ascii")
+            prepare_build_tree(root, project_dir)
             (project_dir / "staging_dir" / "toolchain-x").mkdir(parents=True)
             marker = project_dir / "staging_dir" / "toolchain-x" / "marker"
             marker.write_text("from-archive", encoding="ascii")
@@ -107,11 +143,12 @@ all:
                 """.DEFAULT_GOAL := all
 .PHONY: defconfig download clean all
 defconfig:
-	@test -f clean.marker
 	@test -f .config
+	@touch defconfig.marker
 download:
 	@:
 clean:
+	@test -f defconfig.marker
 	@touch clean.marker
 all:
 	@mkdir -p bin/targets/fixture
@@ -146,17 +183,17 @@ all:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             project_dir = root / "projects" / "fixture"
-            (project_dir / "scripts").mkdir(parents=True)
-            (project_dir / "scripts" / "feeds").write_text("#!/bin/sh\n", encoding="ascii")
+            prepare_build_tree(root, project_dir)
             (project_dir / "Makefile").write_text(
                 """.DEFAULT_GOAL := all
 .PHONY: defconfig download clean all
 defconfig:
-\t@test -f clean.marker
 \t@test -f .config
+\t@touch defconfig.marker
 download:
 \t@:
 clean:
+\t@test -f defconfig.marker
 \t@touch clean.marker
 all:
 \t@mkdir -p bin/targets/fixture
@@ -174,7 +211,8 @@ all:
                 wifi_password="fixture-password",
                 extra_config="CONFIG_PACKAGE_alpha=y\nCONFIG_PACKAGE_beta=y\n",
             )
-            output = Workflow(root).build(project, spec)
+            with patch("core.workflow.current_date", return_value="20990101"):
+                output = Workflow(root).build(project, spec)
             self.assertTrue((output / "fixture" / "firmware.bin").is_file())
             self.assertTrue((project_dir / "clean.marker").is_file())
             configs = next((project_dir / ".builder" / "configs").iterdir())
@@ -201,8 +239,17 @@ all:
             self.assertEqual(len(backups), 1)
             self.assertTrue((backups[0] / "SHA256SUMS").is_file())
             self.assertTrue((backups[0] / "targets" / "fixture" / "firmware.bin").is_file())
-            with patch("core.workflow.timestamp", return_value="20990101-000001"):
+            with (
+                patch("core.workflow.timestamp", return_value="20990101-000001"),
+                patch("core.workflow.current_date", return_value="20990102"),
+            ):
                 Workflow(root).build(project, spec)
             self.assertTrue((project_dir / "clean.marker").is_file())
             logs = sorted((root / "logs").glob("log-x86_64-*.txt"))
-            self.assertIn("每次编译前执行 make clean", logs[-1].read_text(encoding="utf-8"))
+            latest_log = logs[-1].read_text(encoding="utf-8")
+            self.assertIn("初始 make defconfig 完成，执行 make clean", latest_log)
+            self.assertIn("更新当日 feeds：20990102", latest_log)
+            self.assertEqual(
+                (project_dir / "feeds.calls").read_text(encoding="ascii").splitlines(),
+                ["update -a", "install -a", "update -a", "install -a"],
+            )

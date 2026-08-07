@@ -14,6 +14,11 @@ from core.validation import build_config_text
 from core.workflow import OperationCancelled, Workflow, WorkflowError
 
 
+FORCED_CONFIG_TEXT = (
+    Path(__file__).parents[1] / "support" / "forced_config.txt"
+).read_text(encoding="utf-8")
+
+
 class WorkflowTests(unittest.TestCase):
     def test_custom_source_root_is_used_for_project_listing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -216,12 +221,20 @@ class WorkflowTests(unittest.TestCase):
                 command = tuple(arguments)
                 self.commands.append(command)
                 if command == ("make", "defconfig"):
-                    (cwd / ".config").write_text(build_config_text(spec), encoding="utf-8")
+                    (cwd / ".config").write_text(
+                        build_config_text(spec, FORCED_CONFIG_TEXT.splitlines()),
+                        encoding="utf-8",
+                    )
                 if command and command[0] == "make" and len(command) == 2 and command[1].startswith("-j"):
                     raise OperationCancelled("操作已取消。")
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            (root / "support").mkdir()
+            (root / "support" / "forced_config.txt").write_text(
+                FORCED_CONFIG_TEXT,
+                encoding="utf-8",
+            )
             project_dir = root / "project"
             (project_dir / "scripts").mkdir(parents=True)
             (project_dir / "scripts" / "feeds").write_text("", encoding="ascii")

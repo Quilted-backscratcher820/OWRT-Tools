@@ -25,7 +25,11 @@ from .models import BuildSpec, PluginSpec, PrebuiltPackageSpec, ProjectSpec, Scr
 from .packages import PrebuiltPackageError, stage_prebuilt_package, verify_staged_package
 from .scripts import ScriptError, stage_build_script, verify_staged_script
 from .validation import (
+    FORCED_CONFIG_FILE,
+    ValidationError,
+    apply_forced_config_text,
     build_config_text,
+    load_forced_config,
     platform_key,
     require_branch,
     require_component,
@@ -52,6 +56,10 @@ class OperationCancelled(WorkflowError):
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def current_date() -> str:
+    return datetime.now().strftime("%Y%m%d")
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
@@ -224,6 +232,40 @@ class Workflow:
     def _project_metadata_path(self, directory: Path) -> Path:
         return directory / self.INTERNAL_DIR / self.METADATA_FILE
 
+    def _feeds_date_path(self, directory: Path) -> Path:
+        return directory / self.INTERNAL_DIR / "feeds-updated-date"
+
+    def _refresh_feeds(self, directory: Path, date_key: str) -> None:
+        feeds = directory / "scripts" / "feeds"
+        if not feeds.is_file():
+            raise WorkflowError("项目不是带 scripts/feeds 的 OpenWrt 源码树。")
+        self.step("更新 feeds")
+        self.runner.run((str(feeds), "update", "-a"), directory)
+        self._assert_not_cancelled()
+        self.step("安装 feeds")
+        self.runner.run((str(feeds), "install", "-a"), directory)
+        atomic_write(self._feeds_date_path(directory), date_key + "\n")
+
+    def _feeds_need_refresh(self, directory: Path, date_key: str) -> bool:
+        try:
+            return self._feeds_date_path(directory).read_text(encoding="ascii").strip() != date_key
+        except OSError:
+            return True
+
+    def _forced_config(self) -> tuple[str, ...]:
+        try:
+            return load_forced_config(self.root / "support" / FORCED_CONFIG_FILE)
+        except ValidationError as exc:
+            raise WorkflowError(str(exc)) from exc
+
+    def _apply_forced_config(self, directory: Path, forced_config: tuple[str, ...]) -> None:
+        config = directory / ".config"
+        try:
+            content = config.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise WorkflowError(f"无法读取待混入的 .config：{exc}") from exc
+        atomic_write(config, apply_forced_config_text(content, forced_config))
+
     def _read_project(self, directory: Path) -> ProjectSpec:
         metadata_path = self._project_metadata_path(directory)
         try:
@@ -272,14 +314,9 @@ class Workflow:
                     self.root,
                 )
                 self._assert_not_cancelled()
-                feeds = directory / "scripts" / "feeds"
-                if not feeds.is_file():
+                if not (directory / "scripts" / "feeds").is_file():
                     raise WorkflowError("克隆结果不是带 scripts/feeds 的 OpenWrt 源码树。")
-                self.step("更新 feeds")
-                self.runner.run((str(feeds), "update", "-a"), directory)
-                self._assert_not_cancelled()
-                self.step("安装 feeds")
-                self.runner.run((str(feeds), "install", "-a"), directory)
+                self._refresh_feeds(directory, current_date())
                 metadata = {"name": project_name, "repository": repository, "branch": branch}
                 atomic_write(self._project_metadata_path(directory), json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
                 self._write("[完成] 项目克隆和 feeds 更新完成。")
@@ -419,6 +456,17 @@ class Workflow:
                 if stage.exists():
                     shutil.rmtree(stage)
         return tuple(installed)
+
+    def _deduplicate_installed_plugins(
+        self,
+        project: ProjectSpec,
+        plugins: tuple[PluginSpec, ...],
+    ) -> None:
+        for plugin in plugins:
+            for package_name in plugin.package_names:
+                keep = project.directory / "package" / "custom" / package_name
+                if keep.is_dir():
+                    self._remove_duplicate_packages(project, package_name, keep)
 
     def _write_settings_package(self, project: ProjectSpec, spec: BuildSpec) -> None:
         """Put defaults in a tiny package instead of editing upstream source files."""
@@ -638,10 +686,16 @@ $(eval $(call BuildPackage,builder-prebuilt))
             raise WorkflowError(f"无法生成预编译软件包集成包：{exc}") from exc
         self._write(f"[预编译包] 已准备 {len(spec.prebuilt_packages)} 个软件包用于固件集成。")
 
-    def _write_initial_config(self, project: ProjectSpec, spec: BuildSpec, stamp: str) -> Path:
+    def _write_initial_config(
+        self,
+        project: ProjectSpec,
+        spec: BuildSpec,
+        stamp: str,
+        forced_config: tuple[str, ...],
+    ) -> Path:
         config = project.directory / ".config"
         self.step("生成初始配置")
-        atomic_write(config, build_config_text(spec))
+        atomic_write(config, build_config_text(spec, forced_config))
         copy = project.directory / self.INTERNAL_DIR / "configs" / stamp / "initial.config"
         copy.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(config, copy)
@@ -650,11 +704,17 @@ $(eval $(call BuildPackage,builder-prebuilt))
         atomic_write(project.directory / self.INTERNAL_DIR / BUILD_SETTINGS_FILE, metadata, mode=0o600)
         return copy
 
-    def _validate_initial_config(self, project: ProjectSpec, spec: BuildSpec, stamp: str) -> Path:
+    def _validate_initial_config(
+        self,
+        project: ProjectSpec,
+        spec: BuildSpec,
+        stamp: str,
+        forced_config: tuple[str, ...],
+    ) -> Path:
         self.step("校验初始配置")
         self.runner.run(("make", "defconfig"), project.directory)
         config = project.directory / ".config"
-        validate_resolved_config(config, spec)
+        validate_resolved_config(config, spec, forced_config)
         copy = project.directory / self.INTERNAL_DIR / "configs" / stamp / "initial-validated.config"
         shutil.copy2(config, copy)
         self._write(f"[校验] 初始配置有效：{copy}")
@@ -718,6 +778,7 @@ $(eval $(call BuildPackage,builder-prebuilt))
         """Download custom packages, validate config, then build one source tree."""
 
         validate_build_spec(spec)
+        forced_config = self._forced_config()
         build_directory = (spec.build_directory or project.directory).expanduser().resolve()
         project = replace(project, directory=build_directory)
         if not (project.directory / "scripts" / "feeds").is_file():
@@ -731,9 +792,6 @@ $(eval $(call BuildPackage,builder-prebuilt))
             stamp = f"{base_stamp}-{suffix}"
             suffix += 1
         with self.operation_log(platform_key(spec.platform)) as log_path:
-            self.step("清理编译目录")
-            self._write("[构建] 每次编译前执行 make clean。")
-            self.runner.run(("make", "clean"), project.directory)
             manifest = self.latest_toolchain_manifest(project, spec.platform)
             if manifest is not None:
                 self._write(f"[工具链] 自动应用最新匹配工具链：{manifest.name}")
@@ -758,6 +816,10 @@ $(eval $(call BuildPackage,builder-prebuilt))
                 self._write(
                     f"[输入] 常规配置：{len(config_lines)} 行；SHA256：{config_digest}"
                 )
+            self._write(
+                f"[配置] 强制混入 {len(forced_config)} 项："
+                + " ".join(forced_config)
+            )
             for package in spec.prebuilt_packages:
                 self._write(f"[输入] 预编译包：{package.filename}；SHA256：{package.sha256}")
             resolved_plugins = self._install_plugins(project, spec.plugins)
@@ -767,15 +829,27 @@ $(eval $(call BuildPackage,builder-prebuilt))
             self._write_settings_package(project, spec)
             self.step("准备预编译软件包")
             self._write_prebuilt_package(project, spec)
-            self._write_initial_config(project, spec, stamp)
+            self._write_initial_config(project, spec, stamp, forced_config)
             self._run_custom_script(project, spec)
-            self._write_build_identifier(project, spec.build_id)
-            self._validate_initial_config(project, spec, stamp)
+            self._apply_forced_config(project.directory, forced_config)
+            self._validate_initial_config(project, spec, stamp, forced_config)
             self._assert_not_cancelled()
+            self.step("清理编译目录")
+            self._write("[构建] 初始 make defconfig 完成，执行 make clean。")
+            self.runner.run(("make", "clean"), project.directory)
+            date_key = current_date()
+            if self._feeds_need_refresh(project.directory, date_key):
+                self._write(f"[feeds] 日期变更或缺少记录，更新当日 feeds：{date_key}")
+                self._refresh_feeds(project.directory, date_key)
+                self._deduplicate_installed_plugins(project, spec.plugins)
+            else:
+                self._write(f"[feeds] 当日已更新，跳过重复更新：{date_key}")
+            self._apply_forced_config(project.directory, forced_config)
+            self._write_build_identifier(project, spec.build_id)
             self.step("生成最终配置")
             self.final_config_started()
             self.runner.run(("make", "defconfig"), project.directory)
-            validate_resolved_config(project.directory / ".config", spec)
+            validate_resolved_config(project.directory / ".config", spec, forced_config)
             final_copy = project.directory / self.INTERNAL_DIR / "configs" / stamp / "final.config"
             shutil.copy2(project.directory / ".config", final_copy)
             self._write(f"[配置] 最终配置：{final_copy}")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from ipaddress import IPv4Address
 from pathlib import Path
 import re
@@ -23,6 +24,7 @@ _CONFIG = re.compile(
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _BUILD_ID = re.compile(r"^OWRT-Tools-\d{8}-\d{6}$")
 _PREBUILT_SUFFIXES = frozenset({".apk", ".ipk"})
+FORCED_CONFIG_FILE = "forced_config.txt"
 
 
 def require_component(value: str, label: str) -> str:
@@ -175,6 +177,94 @@ def validate_extra_config(value: str) -> None:
             raise ValidationError(f"常规配置第 {number} 行不是有效的 OpenWrt CONFIG 行。")
 
 
+def config_line_symbol(line: str) -> str | None:
+    """Return the CONFIG symbol represented by one normalized Kconfig line."""
+
+    line = line.strip()
+    if not _CONFIG.fullmatch(line):
+        return None
+    if line.startswith("# CONFIG_") and line.endswith(" is not set"):
+        return line[2 : -len(" is not set")]
+    return line.split("=", 1)[0]
+
+
+def _normalized_config_lines(lines: Iterable[str], label: str) -> tuple[str, ...]:
+    normalized: dict[str, str] = {}
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or (line.startswith("#") and not line.startswith("# CONFIG_")):
+            continue
+        symbol = config_line_symbol(line)
+        if symbol is None:
+            raise ValidationError(f"{label}第 {number} 行不是有效的 OpenWrt CONFIG 行。")
+        normalized.pop(symbol, None)
+        normalized[symbol] = line
+    return tuple(normalized.values())
+
+
+def load_forced_config(path: Path) -> tuple[str, ...]:
+    """Load the hidden, manually maintained settings mixed into every build."""
+
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise ValidationError(f"无法读取强制配置清单：{path}: {exc}") from exc
+    lines = _normalized_config_lines(content.splitlines(), "强制配置清单")
+    if not lines:
+        raise ValidationError(f"强制配置清单为空：{path}")
+    return lines
+
+
+def without_config_symbols(value: str, hidden_lines: Iterable[str]) -> str:
+    """Remove tool-managed symbols from text before exposing it to the GUI."""
+
+    hidden = {
+        symbol
+        for line in hidden_lines
+        if (symbol := config_line_symbol(line)) is not None
+    }
+    if not hidden:
+        return value
+    return "".join(
+        raw
+        for raw in value.splitlines(keepends=True)
+        if config_line_symbol(raw) not in hidden
+    )
+
+
+def apply_forced_config_text(value: str, forced_config: Iterable[str]) -> str:
+    """Remove conflicting copies and append authoritative settings once."""
+
+    forced_lines = _normalized_config_lines(forced_config, "强制配置")
+    forced_symbols = {
+        symbol
+        for line in forced_lines
+        if (symbol := config_line_symbol(line)) is not None
+    }
+    retained = [
+        raw
+        for raw in value.splitlines()
+        if config_line_symbol(raw) not in forced_symbols
+    ]
+    while retained and not retained[-1]:
+        retained.pop()
+    return "\n".join((*retained, *forced_lines)) + "\n"
+
+
+def _merge_config_lines(*groups: Iterable[str]) -> tuple[str, ...]:
+    merged: dict[str, str] = {}
+    passthrough: list[str] = []
+    for group in groups:
+        for line in group:
+            symbol = config_line_symbol(line)
+            if symbol is None:
+                passthrough.append(line.strip())
+                continue
+            merged.pop(symbol, None)
+            merged[symbol] = line.strip()
+    return tuple((*passthrough, *merged.values()))
+
+
 def config_symbols(spec: BuildSpec) -> tuple[str, ...]:
     """Return the selectors that must survive make defconfig."""
 
@@ -207,9 +297,10 @@ def prebuilt_config_symbols(spec: BuildSpec) -> tuple[str, ...]:
     return ("CONFIG_PACKAGE_builder-prebuilt",) if spec.prebuilt_packages else ()
 
 
-def build_config_text(spec: BuildSpec) -> str:
+def build_config_text(spec: BuildSpec, forced_config: Iterable[str] = ()) -> str:
     """Create an initial .config without executing any shell fragment."""
 
+    forced_lines = _normalized_config_lines(forced_config, "强制配置")
     managed_names = {
         line.split("=", 1)[0]
         for line in (
@@ -229,9 +320,7 @@ def build_config_text(spec: BuildSpec) -> str:
         line = raw.strip()
         if not line:
             continue
-        name = line.split("=", 1)[0]
-        if line.startswith("# ") and line.endswith(" is not set"):
-            name = line[2:-len(" is not set")]
+        name = config_line_symbol(line)
         if name not in managed_names:
             lines.append(line)
     lines.extend(
@@ -246,10 +335,14 @@ def build_config_text(spec: BuildSpec) -> str:
         lines.append("CONFIG_TARGET_MULTI_PROFILE=y")
     lines.extend(f"{symbol}=y" for symbol in prebuilt_config_symbols(spec))
     lines.extend(f"{symbol}=y" for symbol in plugin_config_symbols(spec))
-    return "\n".join(dict.fromkeys(lines)) + "\n"
+    return "\n".join(_merge_config_lines(lines, forced_lines)) + "\n"
 
 
-def validate_resolved_config(path: Path, spec: BuildSpec) -> None:
+def validate_resolved_config(
+    path: Path,
+    spec: BuildSpec,
+    forced_config: Iterable[str] = (),
+) -> None:
     """Fail when Kconfig removed an explicitly requested target or device."""
 
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -270,3 +363,19 @@ def validate_resolved_config(path: Path, spec: BuildSpec) -> None:
     ]
     if missing_prebuilt:
         raise ValidationError("make defconfig 后未保留预编译软件包集成包。")
+    settings = {line.strip() for line in text.splitlines()}
+    missing_forced: list[str] = []
+    for line in _normalized_config_lines(forced_config, "强制配置"):
+        symbol = config_line_symbol(line)
+        assert symbol is not None
+        disabled = {f"{symbol}=n", f"# {symbol} is not set"}
+        if line.endswith("=n") or line.startswith("# CONFIG_"):
+            present = bool(settings & disabled)
+        else:
+            present = line in settings
+        if not present:
+            missing_forced.append(symbol)
+    if missing_forced:
+        raise ValidationError(
+            "make defconfig 后未保留强制配置：" + "、".join(missing_forced)
+        )

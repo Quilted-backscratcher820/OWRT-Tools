@@ -15,6 +15,22 @@ from core.validation import build_config_text
 
 
 class ConfigurationImportTests(unittest.TestCase):
+    def test_forced_config_is_not_exposed_by_config_import(self) -> None:
+        forced = ("CONFIG_CCACHE=y", "CONFIG_FEED_video=n")
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / ".config"
+            config.write_text(
+                "CONFIG_TARGET_x86=y\n"
+                "CONFIG_TARGET_x86_64=y\n"
+                "CONFIG_TARGET_DEVICE_x86_64_DEVICE_generic=y\n"
+                "CONFIG_CCACHE=y\n"
+                "# CONFIG_FEED_video is not set\n"
+                "CONFIG_PACKAGE_htop=y\n",
+                encoding="ascii",
+            )
+            imported = load_build_config(config, forced)
+            self.assertEqual(imported.extra_config, "CONFIG_PACKAGE_htop=y\n")
+
     def test_complete_project_config_requires_selected_device(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

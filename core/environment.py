@@ -11,6 +11,7 @@ import time
 from typing import Callable
 
 from .models import EnvironmentCheck, EnvironmentReport
+from .validation import FORCED_CONFIG_FILE, ValidationError, load_forced_config
 
 
 LogCallback = Callable[[str], None]
@@ -87,7 +88,15 @@ class EnvironmentProbe:
             import_module("PySide6")
         except (ImportError, OSError) as exc:
             return EnvironmentCheck("运行工具", False, f"无法导入 PySide6：{exc}")
-        return EnvironmentCheck("运行工具", True, "Python、PySide6、git、curl、make 可用")
+        try:
+            load_forced_config(self.root / "support" / FORCED_CONFIG_FILE)
+        except ValidationError as exc:
+            return EnvironmentCheck("运行工具", False, str(exc))
+        return EnvironmentCheck(
+            "运行工具",
+            True,
+            "Python、PySide6、git、curl、make 和强制配置清单可用",
+        )
 
     def _permission_check(self) -> EnvironmentCheck:
         if os.name != "posix":

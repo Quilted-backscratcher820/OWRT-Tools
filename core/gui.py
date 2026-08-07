@@ -56,7 +56,9 @@ from .models import (
 )
 from .ui import AdaptiveColumnSizer
 from .validation import (
+    FORCED_CONFIG_FILE,
     ValidationError,
+    load_forced_config,
     platform_key,
     require_branch,
     require_component,
@@ -205,6 +207,9 @@ class MainWindow(QMainWindow):
         self.install_timer = QTimer(self)
         self.install_timer.setInterval(500)
         self.install_timer.timeout.connect(self._poll_installation)
+
+    def _forced_config(self) -> tuple[str, ...]:
+        return load_forced_config(self.root / "support" / FORCED_CONFIG_FILE)
 
     def _action_button(
         self,
@@ -854,7 +859,14 @@ class MainWindow(QMainWindow):
         self._config_override_notified = False
         self._project_config_path = None
         if self.current_project is not None:
-            imported = load_complete_project_config(self.current_project.directory)
+            try:
+                imported = load_complete_project_config(
+                    self.current_project.directory,
+                    self._forced_config(),
+                )
+            except ValidationError as exc:
+                self.append_log(f"[配置] 无法读取强制配置清单：{exc}")
+                imported = None
             if imported is not None:
                 self._config_loading = True
                 try:
@@ -1190,8 +1202,8 @@ class MainWindow(QMainWindow):
             return
         path = Path(selected[0])
         try:
-            imported = load_build_config(path)
-        except ConfigurationError as exc:
+            imported = load_build_config(path, self._forced_config())
+        except (ConfigurationError, ValidationError) as exc:
             QMessageBox.warning(self, "配置导入失败", str(exc))
             return
         self._mark_project_config_modified()

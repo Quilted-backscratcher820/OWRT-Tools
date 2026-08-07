@@ -8,6 +8,7 @@ from core.models import BuildSpec, PluginSpec, PrebuiltPackageSpec
 from core.validation import (
     ValidationError,
     build_config_text,
+    load_forced_config,
     platform_key,
     split_platform,
     validate_build_spec,
@@ -31,6 +32,44 @@ def valid_spec(**changes: object) -> BuildSpec:
 
 
 class ValidationTests(unittest.TestCase):
+    def test_forced_config_overrides_conflicts_and_is_validated(self) -> None:
+        spec = valid_spec(
+            extra_config=(
+                "# retain this comment\n"
+                "CONFIG_CCACHE=n\n"
+                "CONFIG_FEED_video=y\n"
+                "CONFIG_PACKAGE_htop=y\n"
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "forced_config.txt"
+            path.write_text(
+                "# manually maintained\n"
+                "CONFIG_CCACHE=n\n"
+                "CONFIG_CCACHE=y\n"
+                "CONFIG_FEED_video=n\n",
+                encoding="ascii",
+            )
+            forced = load_forced_config(path)
+            self.assertEqual(forced, ("CONFIG_CCACHE=y", "CONFIG_FEED_video=n"))
+            config_text = build_config_text(spec, forced)
+            self.assertEqual(config_text.count("CONFIG_CCACHE="), 1)
+            self.assertIn("# retain this comment\n", config_text)
+            self.assertIn("CONFIG_CCACHE=y\n", config_text)
+            self.assertNotIn("CONFIG_FEED_video=y", config_text)
+            resolved = Path(temporary) / ".config"
+            resolved.write_text(
+                config_text.replace("CONFIG_FEED_video=n", "# CONFIG_FEED_video is not set"),
+                encoding="ascii",
+            )
+            validate_resolved_config(resolved, spec, forced)
+            resolved.write_text(
+                resolved.read_text(encoding="ascii").replace("CONFIG_CCACHE=y\n", ""),
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(ValidationError, "强制配置"):
+                validate_resolved_config(resolved, spec, forced)
+
     def test_platform_forms_create_target_and_device_symbols(self) -> None:
         self.assertEqual(split_platform("mediatek_filogic"), ("mediatek", "filogic"))
         self.assertEqual(platform_key("qualcommax/ipq60xx"), "qualcommax_ipq60xx")

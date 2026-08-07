@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -10,7 +11,13 @@ import shlex
 from typing import Any
 
 from .models import BuildSpec, PluginSpec, PrebuiltPackageSpec, ScriptSpec, new_build_id
-from .validation import ValidationError, platform_key, validate_build_spec
+from .validation import (
+    ValidationError,
+    config_line_symbol,
+    platform_key,
+    validate_build_spec,
+    without_config_symbols,
+)
 
 
 BUILD_SETTINGS_FILE = "build-settings.json"
@@ -215,7 +222,10 @@ def _read_text(path: Path) -> str:
         raise ConfigurationError(f"无法读取配置文件：{path}: {exc}") from exc
 
 
-def _parse_openwrt_config(text: str) -> tuple[str, tuple[str, ...], str]:
+def _parse_openwrt_config(
+    text: str,
+    hidden_config: Iterable[str] = (),
+) -> tuple[str, tuple[str, ...], str]:
     settings = [
         line.strip()
         for line in text.splitlines()
@@ -253,6 +263,11 @@ def _parse_openwrt_config(text: str) -> tuple[str, tuple[str, ...], str]:
         devices = ()
     target_parts = platform.split("_", 1)
     managed_targets = {platform, target_parts[0]}
+    hidden_symbols = {
+        symbol
+        for line in hidden_config
+        if (symbol := config_line_symbol(line)) is not None
+    }
     extra: list[str] = []
     for line in settings:
         target = _ENABLED_TARGET.fullmatch(line)
@@ -263,6 +278,8 @@ def _parse_openwrt_config(text: str) -> tuple[str, tuple[str, ...], str]:
         if target and target.group(1) in managed_targets:
             continue
         if line.startswith("CONFIG_TARGET_PROFILE="):
+            continue
+        if config_line_symbol(line) in hidden_symbols:
             continue
         extra.append(line)
     return platform, devices, "\n".join(dict.fromkeys(extra)) + ("\n" if extra else "")
@@ -322,10 +339,14 @@ def _metadata_candidates(config_path: Path) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(candidates))
 
 
-def load_build_config(path: Path) -> ImportedBuildConfig:
+def load_build_config(
+    path: Path,
+    forced_config: Iterable[str] = (),
+) -> ImportedBuildConfig:
     """Load a normal .config or a tool-generated build-settings JSON file."""
 
     path = path.expanduser().resolve()
+    forced_lines = tuple(forced_config)
     if not path.is_file():
         raise ConfigurationError(f"配置文件不存在：{path}")
     if path.suffix.lower() == ".json":
@@ -333,7 +354,7 @@ def load_build_config(path: Path) -> ImportedBuildConfig:
         return ImportedBuildConfig(
             platform=spec.platform,
             devices=spec.devices,
-            extra_config=spec.extra_config,
+            extra_config=without_config_symbols(spec.extra_config, forced_lines),
             hostname=spec.hostname,
             ip_address=spec.ip_address,
             wifi_ssid=spec.wifi_ssid,
@@ -347,7 +368,7 @@ def load_build_config(path: Path) -> ImportedBuildConfig:
             backup_directory=spec.backup_directory,
             metadata_path=path,
         )
-    platform, devices, extra_config = _parse_openwrt_config(_read_text(path))
+    platform, devices, extra_config = _parse_openwrt_config(_read_text(path), forced_lines)
     for metadata_path in _metadata_candidates(path):
         if not metadata_path.is_file():
             continue
@@ -357,7 +378,7 @@ def load_build_config(path: Path) -> ImportedBuildConfig:
         return ImportedBuildConfig(
             platform=spec.platform,
             devices=spec.devices,
-            extra_config=spec.extra_config,
+            extra_config=without_config_symbols(spec.extra_config, forced_lines),
             hostname=spec.hostname,
             ip_address=spec.ip_address,
             wifi_ssid=spec.wifi_ssid,
@@ -383,14 +404,17 @@ def load_build_config(path: Path) -> ImportedBuildConfig:
     )
 
 
-def load_complete_project_config(project_directory: Path) -> ImportedBuildConfig | None:
+def load_complete_project_config(
+    project_directory: Path,
+    forced_config: Iterable[str] = (),
+) -> ImportedBuildConfig | None:
     """Load a project's complete .config, or return None when it is incomplete."""
 
     path = project_directory.expanduser().resolve() / ".config"
     if not path.is_file():
         return None
     try:
-        imported = load_build_config(path)
+        imported = load_build_config(path, forced_config)
     except ConfigurationError:
         return None
     if not imported.devices:

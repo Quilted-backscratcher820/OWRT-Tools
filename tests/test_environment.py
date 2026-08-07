@@ -9,7 +9,33 @@ from core.environment import EnvironmentProbe
 from core.models import EnvironmentCheck
 
 
+FORCED_CONFIG_TEXT = (
+    Path(__file__).parents[1] / "support" / "forced_config.txt"
+).read_text(encoding="utf-8")
+
+
 class EnvironmentTests(unittest.TestCase):
+    def test_runtime_check_requires_valid_forced_config_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "support").mkdir()
+            probe = EnvironmentProbe(root)
+            with (
+                patch("core.environment.shutil.which", return_value="/usr/bin/tool"),
+                patch("core.environment.import_module"),
+            ):
+                self.assertFalse(probe._runtime_check().ok)
+                (root / "support" / "forced_config.txt").write_text(
+                    "invalid\n",
+                    encoding="ascii",
+                )
+                self.assertFalse(probe._runtime_check().ok)
+                (root / "support" / "forced_config.txt").write_text(
+                    FORCED_CONFIG_TEXT,
+                    encoding="utf-8",
+                )
+                self.assertTrue(probe._runtime_check().ok)
+
     def test_dependency_candidates_and_main_domains(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
