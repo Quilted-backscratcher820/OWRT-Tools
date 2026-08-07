@@ -1,0 +1,2 @@
+# GUI runtime dependency. Installed into the system Python; no virtualenv is created.
+PySide6

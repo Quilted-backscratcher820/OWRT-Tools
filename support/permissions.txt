@@ -1,0 +1,7 @@
+# Linux and WSL2 entrypoint permissions restored after extraction or copying.
+755 run_owrt_linux.desktop
+755 run_owrt_linux.sh
+755 support/install.sh
+755 support/restore_permissions.sh
+755 support/run_gui.sh
+755 support/system_setup.sh
