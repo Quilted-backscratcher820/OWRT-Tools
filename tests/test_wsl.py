@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from core.wsl import _write_config, inspect_wsl_path
+from core.wsl import _write_config, inspect_wsl_path, sanitize_build_path
 
 
 class WslPathTests(unittest.TestCase):
@@ -75,3 +75,22 @@ class WslPathTests(unittest.TestCase):
             self.assertFalse(status.changed)
             self.assertTrue(status.requires_restart)
             self.assertIn("wsl --shutdown", status.detail)
+
+    def test_build_path_removes_windows_entries_and_shell_fragments(self) -> None:
+        sanitized, removed = sanitize_build_path(
+            "/usr/bin:/mnt/c/Program Files (x86)/dotnet:/mnt/d/Tools:(x86)/broken",
+            wsl=True,
+        )
+        self.assertEqual(sanitized, "/usr/bin")
+        self.assertEqual(
+            removed,
+            (
+                "/mnt/c/Program Files (x86)/dotnet",
+                "/mnt/d/Tools",
+                "(x86)/broken",
+            ),
+        )
+
+    def test_build_path_is_unchanged_outside_wsl(self) -> None:
+        value = "/usr/bin:/mnt/c/Program Files (x86)/dotnet"
+        self.assertEqual(sanitize_build_path(value, wsl=False), (value, ()))

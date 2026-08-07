@@ -44,6 +44,36 @@ def windows_path_entries(path_value: str | None = None) -> tuple[str, ...]:
     return tuple(entry for entry in value.split(os.pathsep) if _WINDOWS_PATH.match(entry))
 
 
+def sanitize_build_path(
+    path_value: str | None = None,
+    *,
+    wsl: bool | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Remove inherited Windows PATH entries before running a build command.
+
+    ``/etc/wsl.conf`` prevents new Windows PATH entries after a WSL restart,
+    but an already-running session can still contain them.  Build recipes may
+    interpolate PATH without quoting, so removing those entries is a second,
+    process-local safety net.  Broken PATH conversions can leave fragments
+    containing shell metacharacters; those fragments are removed as well.
+    """
+
+    value = os.environ.get("PATH", "") if path_value is None else path_value
+    if not (running_in_wsl() if wsl is None else wsl):
+        return value, ()
+    entries = value.split(os.pathsep)
+    removed = tuple(
+        entry
+        for entry in entries
+        if _WINDOWS_PATH.match(entry)
+        or any(character in entry for character in "()\t\r\n")
+    )
+    if not removed:
+        return value, ()
+    kept = tuple(entry for entry in entries if entry not in removed)
+    return os.pathsep.join(kept), removed
+
+
 def _append_windows_path_value(content: str) -> str | None:
     parser = ConfigParser(interpolation=None, strict=False)
     parser.optionxform = lambda optionstr: optionstr.lower()

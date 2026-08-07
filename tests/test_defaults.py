@@ -13,6 +13,7 @@ def write_base_defaults(root: Path) -> Path:
     config.parent.mkdir(parents=True)
     config.write_text(
         "lan) ipad=${ipaddr:-\"192.168.1.1\"} ;;\n"
+        "netm=${netmask:-\"255.255.0.0\"}\n"
         "uci -q set system.@system[-1].hostname='OpenWrt'\n",
         encoding="utf-8",
     )
@@ -79,6 +80,7 @@ class SourceDefaultsTests(unittest.TestCase):
             )
             self.assertEqual(result.wireless_files, (target,))
             self.assertIn('${ipaddr:-"192.168.9.1"}', config.read_text())
+            self.assertIn('${netmask:-"255.255.255.0"}', config.read_text())
             self.assertIn(".hostname='router-one'", config.read_text())
             target_text = target.read_text(encoding="utf-8")
             self.assertIn("BASE_SSID='Home'\"'\"'s WiFi'", target_text)

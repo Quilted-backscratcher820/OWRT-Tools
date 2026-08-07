@@ -41,6 +41,7 @@ from .validation import (
     validate_build_spec,
     validate_resolved_config,
 )
+from .wsl import sanitize_build_path
 
 
 LogCallback = Callable[[str], None]
@@ -97,6 +98,7 @@ class CommandRunner:
         self.log = log
         self.cancelled = cancelled
         self._process: subprocess.Popen[str] | None = None
+        self._path_sanitized = False
 
     def cancel(self) -> None:
         process = self._process
@@ -111,6 +113,16 @@ class CommandRunner:
         merged_environment = os.environ.copy()
         if env:
             merged_environment.update(env)
+        sanitized_path, removed_path_entries = sanitize_build_path(
+            merged_environment.get("PATH")
+        )
+        if removed_path_entries:
+            merged_environment["PATH"] = sanitized_path
+            if not self._path_sanitized:
+                self.log(
+                    f"[环境] 已从构建子进程 PATH 移除 {len(removed_path_entries)} 个 Windows 路径项。"
+                )
+                self._path_sanitized = True
         try:
             self._process = subprocess.Popen(
                 command,
@@ -355,13 +367,30 @@ class Workflow:
             return False
         return bool(re.search(rf"^\s*PKG_NAME\s*:?=\s*{re.escape(package_name)}\s*$", content, re.MULTILINE))
 
+    @staticmethod
+    def _makefile_includes_luci(path: Path) -> bool:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return bool(
+            re.search(r"^\s*include\s+[^\n]*luci\.mk\s*$", content, re.MULTILINE)
+        )
+
     def _package_candidates(self, root: Path, package_name: str) -> list[Path]:
         matches: list[Path] = []
         for makefile in root.rglob("Makefile"):
             if ".git" in makefile.parts:
                 continue
             parent = makefile.parent
-            if parent.name == package_name or self._makefile_declares(makefile, package_name):
+            luci_stage = re.fullmatch(
+                rf"plugin-\d+-{re.escape(package_name)}", parent.name
+            ) and self._makefile_includes_luci(makefile)
+            if (
+                parent.name == package_name
+                or self._makefile_declares(makefile, package_name)
+                or luci_stage
+            ):
                 matches.append(parent)
         return matches
 
@@ -462,6 +491,21 @@ class Workflow:
                 )
         return tuple(resolved.items())
 
+    @staticmethod
+    def _detected_plugin_branch(stage: Path) -> str:
+        head = stage / ".git" / "HEAD"
+        try:
+            content = head.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError) as exc:
+            raise WorkflowError(f"无法自动检测插件默认分支：{exc}") from exc
+        prefix = "ref: refs/heads/"
+        if not content.startswith(prefix):
+            raise WorkflowError("插件仓库未指向可用分支，请手动填写插件分支。")
+        try:
+            return require_branch(content.removeprefix(prefix), "自动检测的插件分支")
+        except ValidationError as exc:
+            raise WorkflowError(str(exc)) from exc
+
     def _install_plugins(
         self,
         project: ProjectSpec,
@@ -485,26 +529,31 @@ class Workflow:
             for index, plugin in enumerate(plugins, 1):
                 self._assert_not_cancelled()
                 repository = require_repository(plugin.repository, "插件项目地址")
-                branch = require_branch(plugin.branch, "插件分支")
+                branch = plugin.branch.strip()
+                if branch:
+                    branch = require_branch(branch, "插件分支")
                 stage = staging_root / f"plugin-{index}-{source_name(repository)}"
                 if os.path.lexists(stage):
                     self._remove_path(stage)
                 try:
                     self.step(f"下载自定义插件 {index}/{len(plugins)}")
+                    clone_command = [
+                        "git",
+                        "clone",
+                        "--depth",
+                        "1",
+                        "--single-branch",
+                    ]
+                    if branch:
+                        clone_command.extend(("--branch", branch))
+                    clone_command.extend((repository, str(stage)))
                     self.runner.run(
-                        (
-                            "git",
-                            "clone",
-                            "--depth",
-                            "1",
-                            "--single-branch",
-                            "--branch",
-                            branch,
-                            repository,
-                            str(stage),
-                        ),
+                        tuple(clone_command),
                         project.directory,
                     )
+                    if not branch:
+                        branch = self._detected_plugin_branch(stage)
+                        self._write(f"[插件] 未填写分支，已自动检测默认分支：{branch}")
                     resolved = self._resolve_plugin_packages(stage, plugin.package_names)
                     resolved_names: list[str] = []
                     for package_name, source in resolved:
@@ -671,7 +720,7 @@ $(eval $(call BuildPackage,builder-settings))
             str(path.relative_to(project.directory)) for path in result.wireless_files
         )
         self._write(
-            f"[设置] 已直接修改主机名和 LAN IP："
+            f"[设置] 已直接修改主机名、LAN IP 和 /24 子网掩码："
             f"{result.config_generate.relative_to(project.directory)}"
         )
         self._write(f"[设置] 已直接修改 WiFi 账号和密码：{wireless}")
@@ -1008,7 +1057,7 @@ $(eval $(call BuildPackage,builder-prebuilt))
             )
             for plugin in spec.plugins:
                 self._write(
-                    f"[输入] 插件：{plugin.repository}@{plugin.branch}; "
+                    f"[输入] 插件：{plugin.repository}@{plugin.branch or '自动检测'}; "
                     f"名称：{' '.join(plugin.package_names)}"
                 )
             config_lines = [line for line in spec.extra_config.splitlines() if line.strip()]
@@ -1035,15 +1084,15 @@ $(eval $(call BuildPackage,builder-prebuilt))
             self._apply_forced_config(project.directory, forced_config)
             self._validate_initial_config(project, spec, stamp, forced_config, jobs)
             self._assert_not_cancelled()
-            self.step("清理编译目录")
-            self._write("[构建] 初始 make defconfig 完成，执行 make clean。")
-            self.runner.run(("make", "clean", f"-j{jobs}"), project.directory)
             date_key = current_date()
             if self._feeds_need_refresh(project.directory, date_key):
                 self._write(f"[feeds] 日期变更或缺少记录，更新当日 feeds：{date_key}")
                 self._refresh_feeds(project.directory, date_key)
             else:
                 self._write(f"[feeds] 当日已更新，跳过重复更新：{date_key}")
+            self.step("清理编译目录")
+            self._write("[构建] 初始 make defconfig 完成，执行 make clean。")
+            self.runner.run(("make", "clean", f"-j{jobs}"), project.directory)
             self._deduplicate_installed_plugins(project, spec.plugins)
             self.step("直接修改默认网络设置")
             self._apply_source_defaults(project, spec)
@@ -1171,6 +1220,7 @@ $(eval $(call BuildPackage,builder-prebuilt))
                         entry,
                         arcname=str(self._cache_archive_name(project.directory.expanduser().resolve(), entry)),
                         recursive=True,
+                        filter=self._toolchain_archive_filter,
                     )
             temporary.replace(archive)
             archive_sha256 = sha256_file(archive)
@@ -1201,8 +1251,14 @@ $(eval $(call BuildPackage,builder-prebuilt))
     def _safe_link_target(member: tarfile.TarInfo) -> bool:
         raw_target = member.linkname
         target = Path(raw_target)
-        if not raw_target or "\x00" in raw_target or target.is_absolute():
+        if not raw_target or "\x00" in raw_target:
             return False
+        # OpenWrt's host compiler wrappers commonly point at /usr/bin/*.
+        # An absolute symbolic link only creates a link; an absolute hard link
+        # would make extraction read an arbitrary host file, so it remains
+        # rejected.
+        if target.is_absolute():
+            return member.issym()
         candidates = [target]
         if member.issym():
             candidates.insert(0, Path(member.name).parent / target)
@@ -1224,7 +1280,13 @@ $(eval $(call BuildPackage,builder-prebuilt))
 
     @staticmethod
     def _safe_extract(handle: tarfile.TarFile, destination: Path) -> None:
-        for member in handle.getmembers():
+        members = handle.getmembers()
+        symlink_names = {
+            Path(member.name)
+            for member in members
+            if member.issym()
+        }
+        for member in members:
             path = Path(member.name)
             if (
                 path.is_absolute()
@@ -1237,10 +1299,22 @@ $(eval $(call BuildPackage,builder-prebuilt))
                 if not Workflow._safe_link_target(member):
                     raise WorkflowError(f"工具链归档包含不安全链接：{member.name}")
                 continue
+            if any(path.parent == link or link in path.parents for link in symlink_names):
+                raise WorkflowError(f"工具链归档包含穿过符号链接的路径：{member.name}")
             if not member.isdir() and not member.isreg():
                 raise WorkflowError(f"工具链归档包含不支持的文件类型：{member.name}")
-        for member in handle.getmembers():
-            handle.extract(member, destination)
+        for member in members:
+            if hasattr(tarfile, "fully_trusted_filter"):
+                handle.extract(member, destination, filter="fully_trusted")
+            else:
+                handle.extract(member, destination)
+
+    @staticmethod
+    def _toolchain_archive_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        if member.issym() or member.islnk():
+            if not Workflow._safe_link_target(member):
+                return None
+        return member
 
     @staticmethod
     def _remove_path(path: Path) -> None:
@@ -1387,7 +1461,7 @@ $(eval $(call BuildPackage,builder-prebuilt))
                         self._write(f"[工具链] 已备份旧目录：{old}")
                     touched.append(target)
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(entry, target, symlinks=False)
+                    shutil.copytree(entry, target, symlinks=True)
                     self._write(f"[工具链] 已应用：{target}")
                 self._refresh_openwrt_cache_markers(project)
             except Exception:

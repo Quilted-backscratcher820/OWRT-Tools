@@ -141,7 +141,8 @@ def validate_build_id(value: str) -> str:
 
 def validate_plugin_spec(spec: PluginSpec) -> PluginSpec:
     require_repository(spec.repository, "插件项目地址")
-    require_branch(spec.branch, "插件分支")
+    if spec.branch.strip():
+        require_branch(spec.branch, "插件分支")
     if not spec.package_names:
         raise ValidationError("至少输入一个插件名。")
     names = tuple(require_component(name, "插件名") for name in spec.package_names)

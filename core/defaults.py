@@ -37,6 +37,9 @@ class _PendingChange:
 _DEFAULT_IP = re.compile(
     r"(?P<prefix>\$\{ipaddr:-[\"'])(?:\d{1,3}\.){3}\d{1,3}(?P<suffix>[\"']\})"
 )
+_DEFAULT_NETMASK = re.compile(
+    r"(?P<prefix>\bnetm=\$\{netmask:-[\"'])(?:\d{1,3}\.){3}\d{1,3}(?P<suffix>[\"']\})"
+)
 _DEFAULT_HOSTNAME = re.compile(r"(?P<prefix>\.hostname=)'[^'\n]*'")
 _BASE_SSID = re.compile(r"(?m)(?P<prefix>^\s*BASE_SSID=)'[^\n]*'")
 _BASE_WORD = re.compile(r"(?m)(?P<prefix>^\s*BASE_WORD=)'[^\n]*'")
@@ -139,6 +142,13 @@ def _apply_config_generate(
         _DEFAULT_IP,
         lambda match: f"{match.group('prefix')}{ip_address}{match.group('suffix')}",
         "LAN IP",
+        path,
+    )
+    updated = _replace_required(
+        updated,
+        _DEFAULT_NETMASK,
+        lambda match: f"{match.group('prefix')}255.255.255.0{match.group('suffix')}",
+        "LAN 子网掩码",
         path,
     )
     updated = _replace_required(

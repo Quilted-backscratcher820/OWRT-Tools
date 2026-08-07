@@ -26,7 +26,7 @@ class GuiStateTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def test_version_backup_gate_and_plugin_rows(self) -> None:
-        self.assertEqual(__version__, "5.0")
+        self.assertEqual(__version__, "6.0")
         window = MainWindow(Path.cwd())
         window.startup_timer.stop()
         window.resize(900, 720)
@@ -42,6 +42,7 @@ class GuiStateTests(unittest.TestCase):
         self.assertTrue(window.elapsed_label.isHidden())
         self.assertEqual(window.wifi_password_edit.text(), "12345678")
         self.assertEqual(window.wifi_password_edit.echoMode(), QLineEdit.EchoMode.Normal)
+        self.assertEqual(window.plugin_branch_edit.text(), "")
         self.assertNotIn("编译标识", {label.text() for label in window.findChildren(QLabel)})
         with tempfile.TemporaryDirectory() as temporary:
             defaults_window = MainWindow(Path(temporary))
@@ -107,6 +108,7 @@ class GuiStateTests(unittest.TestCase):
             "build_button",
             "save_toolchain_button",
             "apply_toolchain_button",
+            "clear_log_button",
             "about_button",
             "cancel_button",
         ):
@@ -162,12 +164,17 @@ class GuiStateTests(unittest.TestCase):
         assert first_plugin_item is not None
         self.assertEqual(first_plugin_item.text(), "axonhub luci-app-axonhub")
         window.plugin_repository_edit.setText("https://github.com/example/packages.git")
+        window.plugin_branch_edit.clear()
         window.plugin_names_edit.setText("luci-app-two")
         window.add_plugin()
         self.assertEqual(window.plugin_table.rowCount(), 2)
         second_plugin_item = window.plugin_table.item(1, 2)
         assert second_plugin_item is not None
         self.assertEqual(second_plugin_item.text(), "luci-app-two")
+        second_branch_item = window.plugin_table.item(1, 1)
+        assert second_branch_item is not None
+        self.assertEqual(second_branch_item.text(), "自动检测")
+        self.assertEqual(window._plugin_specs()[1].branch, "")
         remove_button = cast(QPushButton, window.plugin_table.cellWidget(0, 3))
         self.assertTrue(remove_button.text())
         self.assertFalse(remove_button.icon().isNull())
@@ -183,6 +190,10 @@ class GuiStateTests(unittest.TestCase):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
         self.assertFalse(window.plugin_table.horizontalScrollBar().isVisible())
+        window.append_log("测试日志")
+        self.assertTrue(window.log_edit.toPlainText())
+        window.clear_log()
+        self.assertEqual(window.log_edit.toPlainText(), "")
         window.start_elapsed_timer()
         self.assertFalse(window.elapsed_label.isHidden())
         window._reset_elapsed_timer()

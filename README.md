@@ -2,7 +2,7 @@
 
 一个面向 Linux 和 WSL2 的 PySide6 图形化 OpenWrt 编译工具。它把环境检查、源码管理、配置生成、自定义插件、工具链复用、编译日志和固件备份串成一套可视化工作流。
 
-当前版本：**5.0**
+当前版本：**6.0**
 
 > 本工具会下载并修改 OpenWrt 源码、执行 `make`，还可以运行用户选择的 Shell 脚本。使用前请阅读[安全说明](#安全说明)，并在可恢复的工作目录中操作。
 
@@ -128,7 +128,7 @@ WiFi 密码必填且至少 8 位，在界面中以普通文本显示。
 
 ## 自定义插件
 
-每个插件仓库占一行，需要填写仓库地址、分支和插件名。多个插件名使用空格分隔，名称支持连字符。
+每个插件仓库占一行，需要填写仓库地址和插件名；分支可以留空，工具会从浅克隆结果自动检测默认分支。多个插件名使用空格分隔，名称支持连字符。
 
 构建时工具会浅克隆插件仓库，把匹配的软件包实体复制到 `package/custom/`，并移除源码树或 feeds 中的同名包，避免重复定义。插件中的内部链接会在确认目标仍位于本次克隆目录后复制为实体内容；断链、循环链接、外部路径和特殊文件会被拒绝。OpenWrt 源码、feeds 和工具链自身已有的必要软链接不由本工具改写。
 
@@ -184,8 +184,9 @@ axonhub luci-app-axonhub
 执行可选自定义脚本
 强制混入并去重 support/forced_config.txt
 make defconfig -j$(nproc) 并校验初始配置
+日期变更时更新并安装 feeds
 make clean -j$(nproc)
-日期变更时更新并安装 feeds；每次构建都会再次去重插件
+每次构建都会再次去重插件
 直接修改 config_generate、WiFi 默认值和 LuCI 重连地址，并写入内部编译标识
 make defconfig -j$(nproc) 并校验最终配置
 make download -j$(nproc)
@@ -197,7 +198,7 @@ make -j$(nproc) || make -j1 V=s
 
 主机名、LAN IP、WiFi 账号和密码在编译阶段直接修改 OpenWrt 源码中的 `package/base-files/files/bin/config_generate`、目标平台 WiFi 默认文件或通用 `mac80211.uc`，以及可用的 LuCI `flash.js` 重连地址。工具不再生成 `/etc/uci-defaults/99-builder-settings`，因此固件首次启动时不会依赖开机脚本设置这些值。
 
-源码浅克隆完成时会记录本项目最后一次 feeds 更新日期。后续构建只有在日期变化或旧项目缺少日期记录时，才会在初始 `make defconfig` 和 `make clean` 完成后执行一次 `scripts/feeds update -a` 与 `scripts/feeds install -a`；同一天的重复构建会跳过刷新。
+源码浅克隆完成时会记录本项目最后一次 feeds 更新日期。后续构建只有在日期变化或旧项目缺少日期记录时，才会在初始 `make defconfig` 完成后执行一次 `scripts/feeds update -a` 与 `scripts/feeds install -a`，随后再执行必经的 `make clean`；同一天的重复构建会跳过刷新。
 
 编译计时从生成最终配置开始。停止按钮会请求终止当前任务；具体退出速度取决于正在执行的外部命令。
 
@@ -212,13 +213,13 @@ staging_dir/host
 staging_dir/hostpkg
 ```
 
-下次编译同一“项目名 + 平台名”时会自动应用最新匹配归档。应用前会校验清单、SHA-256、项目名、平台名和归档路径；被替换的现有目录会移动到项目 `.builder/toolchains/`。应用完成后还会按 OpenWrt 的缓存规则刷新 `staging_dir/**/stamp`（排除 target）文件时间，并写入 `tmp/.build=1`，使 `make` 正确认出缓存。工具链页面仍提供手动保存和应用。
+下次编译同一“项目名 + 平台名”时会自动应用最新匹配归档。应用前会校验清单、SHA-256、项目名、平台名和归档路径；被替换的现有目录会移动到项目 `.builder/toolchains/`。归档保留 OpenWrt 必需的绝对、断链和内部软链接，并拒绝会越界的相对链接或硬链接。应用完成后还会按 OpenWrt 的缓存规则刷新 `staging_dir/**/stamp`（排除 target）文件时间，并写入 `tmp/.build=1`，使 `make` 正确认出缓存。工具链页面仍提供手动保存和应用。
 
 工具链不能保证跨源码版本、架构或主机环境兼容。切换上游版本后如果出现异常，应移除不再适用的归档并重新完整编译。
 
 ## 日志、输出和备份
 
-实时日志和保存日志的每一行都带有 `YYYY/MM/DD HH:MM:SS` 时间戳。默认日志文件格式为：
+实时日志和保存日志的每一行都带有 `YYYY/MM/DD HH:MM:SS` 时间戳；工具链页提供“清空日志”按钮，只清空当前界面显示，不删除已保存日志。默认日志文件格式为：
 
 ```text
 logs/log-平台-时间戳.txt
@@ -320,7 +321,7 @@ for script in run_owrt_linux.sh support/*.sh; do bash -n "$script"; done
 python3 support/check_requirements.py
 ```
 
-当前 5.0 版本包含 61 个自动化测试，覆盖环境门禁、WSL PATH 配置、GUI 状态、入口、配置导入、源码默认值直改、强制配置、脚本暂存、插件解析、预编译包、工具链缓存、日志、备份和模拟构建流程。自动化测试不等于所有上游源码、目标设备或真实 WSL/Windows 图形环境都已经完成运行验证。
+当前 6.0 版本包含 69 个自动化测试，覆盖环境门禁、WSL PATH 配置、GUI 状态、入口、配置导入、源码默认值直改、强制配置、脚本暂存、插件解析、预编译包、工具链缓存、日志、备份和模拟构建流程。自动化测试不等于所有上游源码、目标设备或真实 WSL/Windows 图形环境都已经完成运行验证。
 
 版本规则：用户没有明确指定大版本时，每次推送前自动把一位小数版本号递增 `0.1`，并同步代码、桌面入口、测试和 README；明确指定大版本时以用户要求为准。
 

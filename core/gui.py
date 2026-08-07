@@ -520,7 +520,8 @@ class MainWindow(QMainWindow):
         plugin_label_width = self._label_width("项目地址", "分支名", "插件名")
         self.plugin_repository_edit = QLineEdit()
         self.plugin_repository_edit.setPlaceholderText("https://github.com/...git")
-        self.plugin_branch_edit = QLineEdit("main")
+        self.plugin_branch_edit = QLineEdit()
+        self.plugin_branch_edit.setPlaceholderText("留空自动检测默认分支")
         self.plugin_names_edit = QLineEdit()
         self.plugin_names_edit.setPlaceholderText("插件名，多个以空格分开")
         self.add_plugin_button = self._action_button(
@@ -663,7 +664,15 @@ class MainWindow(QMainWindow):
         action_layout.addStretch(1)
         form.addLayout(action_layout)
         layout.addWidget(tools)
-        layout.addWidget(QLabel("实时日志"))
+        log_header = QHBoxLayout()
+        log_header.setContentsMargins(0, 0, 0, 0)
+        log_header.addWidget(QLabel("实时日志"))
+        log_header.addStretch(1)
+        self.clear_log_button = self._action_button(
+            "清空日志", QStyle.StandardPixmap.SP_DialogResetButton, self.clear_log
+        )
+        log_header.addWidget(self.clear_log_button)
+        layout.addLayout(log_header)
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.document().setMaximumBlockCount(5000)
@@ -731,6 +740,7 @@ class MainWindow(QMainWindow):
         self._release_worker(worker)
         on_success(value)
         self._set_workflow_enabled()
+        self._schedule_visual_refresh()
 
     def _job_failed(self, worker: OperationWorker, message: str) -> None:
         self.progress.setRange(0, 1)
@@ -742,11 +752,29 @@ class MainWindow(QMainWindow):
         self.set_step("操作失败" if message != "操作已取消。" else "操作已取消")
         self.append_log(f"[失败] {message}")
         self._set_workflow_enabled()
+        self._schedule_visual_refresh()
         QMessageBox.warning(self, "操作未完成", message)
 
     def append_log(self, message: str) -> None:
         self.log_edit.appendPlainText(timestamp_log_text(message))
         self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
+
+    def clear_log(self) -> None:
+        self.log_edit.clear()
+
+    def _refresh_visuals(self) -> None:
+        self.update()
+        central = self.centralWidget()
+        if central is not None:
+            central.update()
+        self.tabs.update()
+        self.progress.update()
+        self.log_edit.update()
+        self.repaint()
+
+    def _schedule_visual_refresh(self) -> None:
+        QTimer.singleShot(0, self._refresh_visuals)
+        QTimer.singleShot(80, self._refresh_visuals)
 
     def set_step(self, step: str) -> None:
         self.step_label.setText(f"当前步骤：{step}")
@@ -1073,7 +1101,11 @@ class MainWindow(QMainWindow):
         plugins: list[PluginSpec] = []
         for row in range(self.plugin_table.rowCount()):
             repository = self._table_item_text(self.plugin_table, row, 0, "插件项目地址")
-            branch = self._table_item_text(self.plugin_table, row, 1, "插件分支")
+            branch_item = self.plugin_table.item(row, 1)
+            if branch_item is None:
+                raise ValidationError(f"插件分支第 {row + 1} 行为空。")
+            raw_branch = branch_item.data(Qt.ItemDataRole.UserRole)
+            branch = raw_branch if isinstance(raw_branch, str) else branch_item.text()
             names = tuple(self._table_item_text(self.plugin_table, row, 2, "插件名").split())
             plugins.append(PluginSpec(repository, branch, names))
         return tuple(plugins)
@@ -1097,12 +1129,13 @@ class MainWindow(QMainWindow):
         repository = self.plugin_repository_edit.text().strip()
         branch = self.plugin_branch_edit.text().strip()
         names = tuple(self.plugin_names_edit.text().split())
-        if not repository or not branch or not names:
-            QMessageBox.warning(self, "插件信息不完整", "请填写插件项目地址、分支和插件名。")
+        if not repository or not names:
+            QMessageBox.warning(self, "插件信息不完整", "请填写插件项目地址和插件名；分支可留空自动检测。")
             return
         try:
             repository = require_repository(repository, "插件项目地址")
-            branch = require_branch(branch, "插件分支")
+            if branch:
+                branch = require_branch(branch, "插件分支")
             names = tuple(require_component(name, "插件名") for name in names)
             if len(set(names)) != len(names):
                 raise ValidationError("同一插件项目中的插件名不能重复。")
@@ -1118,7 +1151,9 @@ class MainWindow(QMainWindow):
         row = self.plugin_table.rowCount()
         self.plugin_table.insertRow(row)
         self.plugin_table.setItem(row, 0, QTableWidgetItem(plugin.repository))
-        self.plugin_table.setItem(row, 1, QTableWidgetItem(plugin.branch))
+        branch_item = QTableWidgetItem(plugin.branch or "自动检测")
+        branch_item.setData(Qt.ItemDataRole.UserRole, plugin.branch)
+        self.plugin_table.setItem(row, 1, branch_item)
         self.plugin_table.setItem(row, 2, QTableWidgetItem(" ".join(plugin.package_names)))
         remove = QPushButton("移除")
         remove.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton))
@@ -1433,7 +1468,9 @@ class MainWindow(QMainWindow):
             self.set_step("编译完成")
             self.open_output_button.setEnabled(True)
             if self.auto_open_checkbox.isChecked():
-                self.open_output_directory()
+                # Give WSLg one paint cycle before handing the directory to the
+                # host file manager; this avoids a partially rendered final UI.
+                QTimer.singleShot(120, self.open_output_directory)
 
         self._start_job(job, complete)
 

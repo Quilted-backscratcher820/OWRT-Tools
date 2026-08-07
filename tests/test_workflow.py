@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import shutil
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from unittest.mock import patch
 
 from core.models import BuildSpec, PluginSpec, ProjectSpec
 from core.validation import build_config_text
-from core.workflow import OperationCancelled, Workflow, WorkflowError
+from core.workflow import CommandRunner, OperationCancelled, Workflow, WorkflowError
 
 
 FORCED_CONFIG_TEXT = (
@@ -21,6 +22,25 @@ FORCED_CONFIG_TEXT = (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_command_runner_sanitizes_wsl_path_for_child_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            messages: list[str] = []
+            runner = CommandRunner(messages.append, lambda: False)
+            with patch(
+                "core.workflow.sanitize_build_path",
+                return_value=("/safe/path", ("/mnt/c/Program Files (x86)",)),
+            ):
+                runner.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os; print(os.environ['PATH'])",
+                    ),
+                    Path(temporary),
+                )
+            self.assertIn("/safe/path", messages)
+            self.assertTrue(any("移除 1 个 Windows 路径项" in message for message in messages))
+
     def test_custom_source_root_is_used_for_project_listing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -55,6 +75,25 @@ class WorkflowTests(unittest.TestCase):
             workflow = Workflow(root)
             self.assertEqual(workflow._package_candidates(root, "luci-app-test"), [package])
             self.assertEqual(workflow._package_candidates(root, "named-package"), [alternate])
+
+    def test_luci_mk_root_package_matches_only_exact_staging_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            glass = root / "plugin-2-luci-theme-glass"
+            glass.mkdir()
+            (glass / "Makefile").write_text(
+                "include $(TOPDIR)/rules.mk\ninclude ../../luci.mk\n",
+                encoding="ascii",
+            )
+            unrelated = root / "plugin-1-openwrt-daede"
+            unrelated.mkdir()
+            (unrelated / "Makefile").write_text(
+                "include $(TOPDIR)/rules.mk\ninclude ../../luci.mk\n",
+                encoding="ascii",
+            )
+            workflow = Workflow(root)
+            self.assertEqual(workflow._package_candidates(root, "luci-theme-glass"), [glass])
+            self.assertEqual(workflow._package_candidates(root, "glass"), [])
 
     def test_core_plugin_automatically_includes_matching_luci_package(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -135,6 +174,43 @@ class WorkflowTests(unittest.TestCase):
                 )
             self.assertTrue((destination / "payload-link").is_file())
             self.assertEqual((destination / "payload-link").read_text(), "copied")
+
+    def test_plugin_branch_can_be_auto_detected_from_clone(self) -> None:
+        class CloneRunner:
+            def __init__(self, source: Path) -> None:
+                self.source = source
+                self.commands: list[tuple[str, ...]] = []
+
+            def run(self, arguments: tuple[str, ...], cwd: Path, env: object = None) -> None:
+                del cwd, env
+                command = tuple(arguments)
+                self.commands.append(command)
+                target = Path(command[-1])
+                shutil.copytree(self.source, target, symlinks=True)
+                (target / ".git").mkdir()
+                (target / ".git" / "HEAD").write_text(
+                    "ref: refs/heads/master\n", encoding="ascii"
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            package = repository / "axonhub"
+            package.mkdir(parents=True)
+            (package / "Makefile").write_text("PKG_NAME:=axonhub\n", encoding="ascii")
+            project = ProjectSpec(
+                "fixture", "https://github.com/example/fixture.git", "main", root / "project"
+            )
+            workflow = Workflow(root)
+            runner = CloneRunner(repository)
+            workflow.runner = runner  # type: ignore[assignment]
+            installed = workflow._install_plugins(
+                project,
+                (PluginSpec("https://github.com/example/packages.git", "", ("axonhub",)),),
+            )
+            self.assertEqual(installed[0].branch, "master")
+            self.assertNotIn("--branch", runner.commands[0])
+            self.assertTrue((project.directory / "package" / "custom" / "axonhub").is_dir())
 
     def test_plugin_deduplication_is_restored_when_install_transaction_fails(self) -> None:
         class CloneRunner:
@@ -355,6 +431,57 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(link_path.is_symlink())
             self.assertEqual(link_path.read_text(encoding="ascii"), "ok")
 
+    def test_toolchain_save_and_apply_preserves_openwrt_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            binary_dir = source_dir / "staging_dir" / "host" / "bin"
+            binary_dir.mkdir(parents=True)
+            (binary_dir / "compiler").symlink_to("/usr/bin/cc")
+            (binary_dir / "dangling").symlink_to("missing-wrapper")
+            project = ProjectSpec(
+                "fixture", "https://github.com/example/fixture.git", "main", source_dir
+            )
+            manifest = Workflow(root).save_toolchain(project, "x86_64")
+
+            target_dir = root / "target"
+            target = ProjectSpec(
+                "fixture", "https://github.com/example/fixture.git", "main", target_dir
+            )
+            Workflow(root).apply_toolchain(target, "x86_64", manifest)
+
+            compiler = target_dir / "staging_dir" / "host" / "bin" / "compiler"
+            dangling = target_dir / "staging_dir" / "host" / "bin" / "dangling"
+            self.assertTrue(compiler.is_symlink())
+            self.assertEqual(os.readlink(compiler), "/usr/bin/cc")
+            self.assertTrue(dangling.is_symlink())
+            self.assertEqual(os.readlink(dangling), "missing-wrapper")
+
+    def test_toolchain_archive_rejects_symlink_parent_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_path = root / "symlink-parent.tar.gz"
+            with tarfile.open(archive_path, "w:gz") as archive:
+                link = tarfile.TarInfo("staging_dir/toolchain-test/redirect")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "/tmp"
+                archive.addfile(link)
+                data = b"unsafe"
+                child = tarfile.TarInfo(
+                    "staging_dir/toolchain-test/redirect/escaped"
+                )
+                child.size = len(data)
+                archive.addfile(child, io.BytesIO(data))
+            with tarfile.open(archive_path, "r:gz") as archive:
+                with self.assertRaisesRegex(WorkflowError, "穿过符号链接"):
+                    Workflow._safe_extract(archive, root / "out")
+
+    def test_toolchain_archive_rejects_absolute_hard_link(self) -> None:
+        member = tarfile.TarInfo("staging_dir/toolchain-test/hard")
+        member.type = tarfile.LNKTYPE
+        member.linkname = "/etc/passwd"
+        self.assertFalse(Workflow._safe_link_target(member))
+
     def test_cancelled_toolchain_apply_restores_previous_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -435,6 +562,7 @@ class WorkflowTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             config.write_text(
                 "lan) ipad=${ipaddr:-\"192.168.1.1\"} ;;\n"
+                "netm=${netmask:-\"255.255.0.0\"}\n"
                 "uci -q set system.@system[-1].hostname='OpenWrt'\n",
                 encoding="ascii",
             )

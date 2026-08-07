@@ -34,6 +34,7 @@ def prepare_build_tree(root: Path, project: Path) -> None:
     config_generate.parent.mkdir(parents=True)
     config_generate.write_text(
         "lan) ipad=${ipaddr:-\"192.168.1.1\"} ;;\n"
+        "netm=${netmask:-\"255.255.0.0\"}\n"
         "uci -q set system.@system[-1].hostname='OpenWrt'\n",
         encoding="utf-8",
     )
@@ -310,6 +311,7 @@ all:
                 project_dir / "package" / "base-files" / "files" / "bin" / "config_generate"
             ).read_text(encoding="utf-8")
             self.assertIn('${ipaddr:-"192.168.8.1"}', config_generate)
+            self.assertIn('${netmask:-"255.255.255.0"}', config_generate)
             self.assertIn(".hostname='fixture'", config_generate)
             wireless = (
                 project_dir
@@ -329,7 +331,7 @@ all:
             build_log = next((root / "logs").glob("log-x86_64-*.txt")).read_text(
                 encoding="utf-8"
             )
-            self.assertIn("已直接修改主机名和 LAN IP", build_log)
+            self.assertIn("已直接修改主机名、LAN IP 和 /24 子网掩码", build_log)
             self.assertIn("WiFi 密码：fixture-password", build_log)
             self.assertIn("常规配置：2 行；SHA256：", build_log)
             self.assertNotIn("[输入] 常规配置：CONFIG_PACKAGE", build_log)

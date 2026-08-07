@@ -1,6 +1,6 @@
 """OpenWrt local build assistant."""
 
-__version__ = "5.0"
+__version__ = "6.0"
 
 from .models import BuildSpec, PluginSpec, PrebuiltPackageSpec, ProjectSpec, ScriptSpec
 
