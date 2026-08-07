@@ -220,7 +220,7 @@ class WorkflowTests(unittest.TestCase):
                 del env
                 command = tuple(arguments)
                 self.commands.append(command)
-                if command == ("make", "defconfig"):
+                if command[:2] == ("make", "defconfig"):
                     (cwd / ".config").write_text(
                         build_config_text(spec, FORCED_CONFIG_TEXT.splitlines()),
                         encoding="utf-8",
@@ -253,4 +253,6 @@ class WorkflowTests(unittest.TestCase):
             workflow.runner = runner  # type: ignore[assignment]
             with self.assertRaises(OperationCancelled), patch("core.workflow.os.cpu_count", return_value=2):
                 workflow.build(project, spec)
+            self.assertIn(("make", "defconfig", "-j2"), runner.commands)
+            self.assertIn(("make", "clean", "-j2"), runner.commands)
             self.assertNotIn(("make", "-j1", "V=s"), runner.commands)

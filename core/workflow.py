@@ -710,9 +710,10 @@ $(eval $(call BuildPackage,builder-prebuilt))
         spec: BuildSpec,
         stamp: str,
         forced_config: tuple[str, ...],
+        jobs: str,
     ) -> Path:
         self.step("校验初始配置")
-        self.runner.run(("make", "defconfig"), project.directory)
+        self.runner.run(("make", "defconfig", f"-j{jobs}"), project.directory)
         config = project.directory / ".config"
         validate_resolved_config(config, spec, forced_config)
         copy = project.directory / self.INTERNAL_DIR / "configs" / stamp / "initial-validated.config"
@@ -791,6 +792,7 @@ $(eval $(call BuildPackage,builder-prebuilt))
         while (configs_root / stamp).exists():
             stamp = f"{base_stamp}-{suffix}"
             suffix += 1
+        jobs = str(max(1, os.cpu_count() or 1))
         with self.operation_log(platform_key(spec.platform)) as log_path:
             manifest = self.latest_toolchain_manifest(project, spec.platform)
             if manifest is not None:
@@ -832,11 +834,11 @@ $(eval $(call BuildPackage,builder-prebuilt))
             self._write_initial_config(project, spec, stamp, forced_config)
             self._run_custom_script(project, spec)
             self._apply_forced_config(project.directory, forced_config)
-            self._validate_initial_config(project, spec, stamp, forced_config)
+            self._validate_initial_config(project, spec, stamp, forced_config, jobs)
             self._assert_not_cancelled()
             self.step("清理编译目录")
             self._write("[构建] 初始 make defconfig 完成，执行 make clean。")
-            self.runner.run(("make", "clean"), project.directory)
+            self.runner.run(("make", "clean", f"-j{jobs}"), project.directory)
             date_key = current_date()
             if self._feeds_need_refresh(project.directory, date_key):
                 self._write(f"[feeds] 日期变更或缺少记录，更新当日 feeds：{date_key}")
@@ -848,12 +850,11 @@ $(eval $(call BuildPackage,builder-prebuilt))
             self._write_build_identifier(project, spec.build_id)
             self.step("生成最终配置")
             self.final_config_started()
-            self.runner.run(("make", "defconfig"), project.directory)
+            self.runner.run(("make", "defconfig", f"-j{jobs}"), project.directory)
             validate_resolved_config(project.directory / ".config", spec, forced_config)
             final_copy = project.directory / self.INTERNAL_DIR / "configs" / stamp / "final.config"
             shutil.copy2(project.directory / ".config", final_copy)
             self._write(f"[配置] 最终配置：{final_copy}")
-            jobs = str(max(1, os.cpu_count() or 1))
             self.step("下载编译依赖")
             self.runner.run(("make", "download", f"-j{jobs}"), project.directory)
             self._assert_not_cancelled()

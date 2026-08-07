@@ -12,6 +12,7 @@ from typing import Callable
 
 from .models import EnvironmentCheck, EnvironmentReport
 from .validation import FORCED_CONFIG_FILE, ValidationError, load_forced_config
+from .wsl import inspect_wsl_path
 
 
 LogCallback = Callable[[str], None]
@@ -113,6 +114,10 @@ class EnvironmentProbe:
             return EnvironmentCheck("运行权限", False, f"工作目录不可写：{exc}")
         return EnvironmentCheck("运行权限", True, "普通用户可写入工作目录")
 
+    def _wsl_path_check(self) -> EnvironmentCheck:
+        status = inspect_wsl_path()
+        return EnvironmentCheck("WSL PATH", status.ok, status.detail)
+
     def _network_check(self, name: str, url: str) -> EnvironmentCheck:
         self.log(f"[检测] {name}: {url}")
         try:
@@ -171,7 +176,12 @@ class EnvironmentProbe:
         if self.cancelled():
             return EnvironmentReport((EnvironmentCheck("检测状态", False, "检测已取消"),))
         checks: list[EnvironmentCheck] = []
-        for check_factory in (self._dependency_check, self._runtime_check, self._permission_check):
+        for check_factory in (
+            self._dependency_check,
+            self._runtime_check,
+            self._wsl_path_check,
+            self._permission_check,
+        ):
             check = check_factory()
             checks.append(check)
             if self.cancelled():

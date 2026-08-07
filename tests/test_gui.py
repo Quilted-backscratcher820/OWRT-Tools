@@ -25,7 +25,7 @@ class GuiStateTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def test_version_backup_gate_and_plugin_rows(self) -> None:
-        self.assertEqual(__version__, "4.0")
+        self.assertEqual(__version__, "4.1")
         window = MainWindow(Path.cwd())
         window.startup_timer.stop()
         window.resize(900, 720)
@@ -220,6 +220,19 @@ class GuiStateTests(unittest.TestCase):
                 )
             )
             window._display_environment_report(report)
+            window.environment_sizer.refresh()
+            for column in (0, 1):
+                self.assertGreaterEqual(window.environment_table.columnWidth(column), 104)
+                self.assertEqual(
+                    window.environment_table.horizontalHeaderItem(column).textAlignment(),
+                    Qt.AlignmentFlag.AlignCenter,
+                )
+            for row in range(2):
+                for column in (0, 1):
+                    self.assertEqual(
+                        window.environment_table.item(row, column).textAlignment(),
+                        Qt.AlignmentFlag.AlignCenter,
+                    )
             self.assertEqual(window.environment_table.item(0, 1).foreground().color().name(), "#15803d")
             self.assertEqual(window.environment_table.item(1, 1).foreground().color().name(), "#c62828")
             window.report = EnvironmentReport((EnvironmentCheck("依赖", True, "ok"),))

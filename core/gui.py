@@ -267,9 +267,17 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         self.environment_table = QTableWidget(0, 3)
         self.environment_table.setHorizontalHeaderLabels(("检查项", "状态", "详情"))
+        self.environment_table.horizontalHeader().setMinimumSectionSize(104)
+        for column in (0, 1):
+            header_item = self.environment_table.horizontalHeaderItem(column)
+            header_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.environment_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.environment_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.environment_sizer = AdaptiveColumnSizer(self.environment_table, stretch_column=2)
+        self.environment_sizer = AdaptiveColumnSizer(
+            self.environment_table,
+            stretch_column=2,
+            fixed_columns=(0, 1),
+        )
         layout.addWidget(self.environment_table)
         buttons = QHBoxLayout()
         buttons.setSpacing(self.ROW_SPACING)
@@ -753,8 +761,11 @@ class MainWindow(QMainWindow):
         for check in report.checks:
             row = self.environment_table.rowCount()
             self.environment_table.insertRow(row)
-            self.environment_table.setItem(row, 0, QTableWidgetItem(check.name))
+            check_item = QTableWidgetItem(check.name)
+            check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.environment_table.setItem(row, 0, check_item)
             status_item = QTableWidgetItem("通过" if check.ok else "失败")
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             status_item.setForeground(
                 QBrush(QColor("#15803d" if check.ok else "#c62828"))
             )

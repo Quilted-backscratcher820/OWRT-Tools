@@ -2,7 +2,7 @@
 
 一个面向 Linux 和 WSL2 的 PySide6 图形化 OpenWrt 编译工具。它把环境检查、源码管理、配置生成、自定义插件、工具链复用、编译日志和固件备份串成一套可视化工作流。
 
-当前版本：**4.0**
+当前版本：**4.1**
 
 > 本工具会下载并修改 OpenWrt 源码、执行 `make`，还可以运行用户选择的 Shell 脚本。使用前请阅读[安全说明](#安全说明)，并在可恢复的工作目录中操作。
 
@@ -57,6 +57,8 @@ Linux 桌面环境也可以双击 [`run_owrt_linux.desktop`](run_owrt_linux.desk
 
 CMD 入口不会从 `C:\`、`D:\` 等 Windows 原生路径启动。WSL2 还需要 WSLg，或已经正确配置的 X11/Wayland 图形环境。
 
+首次启动时，工具会在 WSL 环境检查 `/etc/wsl.conf` 的 `[interop] appendWindowsPath=false`。如果配置项不存在，工具会尝试添加；修改成功后会暂时锁定后续页面，并提示在普通 Windows CMD 或 PowerShell 中运行 `wsl --shutdown`，再重新启动工具。这样可以避免 Windows 的 `/mnt/<盘符>/...` 路径混入 Linux `PATH`，导致 OpenWrt 工具链命令因路径空格或 Windows 程序优先级而报错。配置已关闭但当前会话仍有 Windows 路径时，也必须先重启 WSL。
+
 ## 首次运行
 
 入口固定使用系统 Python，不创建虚拟环境，也不调用远程环境初始化脚本。依赖不完整时会运行本地 [`support/system_setup.sh`](support/system_setup.sh)，依次执行：
@@ -81,7 +83,7 @@ apt-get clean
 3. **添加项目**：填写项目地址、分支和项目名。工具会浅克隆源码，然后执行 `scripts/feeds update -a` 和 `scripts/feeds install -a`。
 4. **选择配置**：选择已有项目并填写平台、设备、主机名、LAN IP、WiFi 账号和密码。
 5. **添加扩展**：按需添加插件仓库、导入 IPK/APK、导入配置或选择自定义脚本。
-6. **开始编译**：点击“修改并开始编译”。工具会清理源码树、准备插件和设置、生成并校验配置、下载依赖，然后编译固件。
+6. **开始编译**：点击“修改并开始编译”。工具会按顺序准备源码和插件、生成初始配置、执行自定义脚本、运行并行 `defconfig`、并行清理、下载依赖，然后编译固件。
 7. **查看结果**：成功后打开项目的 `bin/targets/`，或使用自动打开选项。
 8. **保存产物**：启用备份时，固件、配置、日志和校验文件会保存到独立的时间戳目录。
 
@@ -173,20 +175,21 @@ axonhub luci-app-axonhub
 每次构建都执行以下核心步骤：
 
 ```text
+源码浅克隆（添加项目时）
+更新并安装 feeds（添加项目时；跨日期构建时在初始 defconfig 和 clean 后再次执行）
 自动应用匹配工具链
 下载和去重自定义插件
 生成默认设置与预编译包集成项
-生成初始 .config
+编辑初始 .config
 执行可选自定义脚本
 强制混入并去重 support/forced_config.txt
-make defconfig 并校验初始配置
-make clean
-日期变更时更新、安装 feeds 并再次去重插件
+make defconfig -j$(nproc) 并校验初始配置
+make clean -j$(nproc)
+日期变更时更新并安装 feeds，再次去重插件
 再次强制混入配置并写入内部编译标识
-make defconfig 并校验最终配置
+make defconfig -j$(nproc) 并校验最终配置
 make download -j$(nproc)
-make -j$(nproc)
-失败时 make -j1 V=s
+make -j$(nproc) || make -j1 V=s
 备份固件并自动保存工具链
 ```
 
@@ -277,6 +280,23 @@ python3 support/check_requirements.py
 
 确认仓库位于 WSL 文件系统，并从 `\\wsl.localhost\...` 或 `\\wsl$\...` 路径双击 CMD。Windows 盘符路径不会被转换为 WSL 路径。
 
+### WSL PATH 检查失败
+
+检查 `/etc/wsl.conf` 是否包含：
+
+```ini
+[interop]
+appendWindowsPath=false
+```
+
+修改后必须关闭并重启 WSL。最直接的方式是在 Windows CMD 或 PowerShell 执行：
+
+```powershell
+wsl --shutdown
+```
+
+然后重新打开对应发行版和本工具。该设置参考 [OpenWrt WSL 构建文档](https://openwrt.org/docs/guide-developer/toolchain/wsl)；当前会话在重启前仍可能保留旧的 Windows PATH。
+
 ### 导入脚本后无法编译
 
 脚本必须能通过 `dos2unix` 和 `bash -n`，且暂存后不能再被修改。如果脚本运行失败，查看日志中“执行自定义脚本”步骤的原始错误。
@@ -297,7 +317,7 @@ for script in run_owrt_linux.sh support/*.sh; do bash -n "$script"; done
 python3 support/check_requirements.py
 ```
 
-当前 4.0 版本包含 45 个自动化测试，覆盖环境门禁、GUI 状态、入口、配置导入、强制配置、脚本暂存、插件解析、预编译包、工具链、日志、备份和模拟构建流程。自动化测试不等于所有上游源码、目标设备或真实 WSL/Windows 图形环境都已经完成运行验证。
+当前 4.1 版本包含 50 个自动化测试，覆盖环境门禁、WSL PATH 配置、GUI 状态、入口、配置导入、强制配置、脚本暂存、插件解析、预编译包、工具链、日志、备份和模拟构建流程。自动化测试不等于所有上游源码、目标设备或真实 WSL/Windows 图形环境都已经完成运行验证。
 
 版本规则：用户没有明确指定大版本时，每次推送前自动把一位小数版本号递增 `0.1`，并同步代码、桌面入口、测试和 README；明确指定大版本时以用户要求为准。
 
