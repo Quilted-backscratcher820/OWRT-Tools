@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=OpenWrt 本地编译工具 4.0 [Linux]
+Name=OpenWrt 本地编译工具 4.1 [Linux]
 Comment=本地浅克隆、配置并编译 OpenWrt
 Exec=sh -c 'path="$1"; path="${path#file://}"; root="$(dirname "$path")"; exec sh "$root/run_owrt_linux.sh"' builder %k
 Icon=utilities-terminal
