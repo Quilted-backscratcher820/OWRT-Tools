@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
         self.root = root.resolve()
         self.report: EnvironmentReport | None = None
         self.worker: OperationWorker | None = None
+        self._workers: set[OperationWorker] = set()
         self.current_project: ProjectSpec | None = None
         self.project_page: QWidget | None = None
         self.output_directory: Path | None = None
@@ -270,7 +271,8 @@ class MainWindow(QMainWindow):
         self.environment_table.horizontalHeader().setMinimumSectionSize(104)
         for column in (0, 1):
             header_item = self.environment_table.horizontalHeaderItem(column)
-            header_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if header_item is not None:
+                header_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.environment_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.environment_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.environment_sizer = AdaptiveColumnSizer(
@@ -691,8 +693,9 @@ class MainWindow(QMainWindow):
     def _start_job(self, job: Job, on_success: Callable[[Any], None]) -> None:
         if self.worker is not None:
             return
-        worker = OperationWorker(job, self)
+        worker = OperationWorker(job)
         self.worker = worker
+        self._workers.add(worker)
         worker.log.connect(self.append_log)
         worker.step.connect(self.set_step)
         worker.final_config_started.connect(self.start_elapsed_timer)
@@ -704,15 +707,18 @@ class MainWindow(QMainWindow):
         worker.failed.connect(
             lambda message, active_worker=worker: self._job_failed(active_worker, message)
         )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda active_worker=worker: self._forget_worker(active_worker))
         self.progress.setRange(0, 0)
         self._set_workflow_enabled()
         worker.start()
 
     def _release_worker(self, worker: OperationWorker) -> None:
-        worker.wait()
         if self.worker is worker:
             self.worker = None
-        worker.deleteLater()
+
+    def _forget_worker(self, worker: OperationWorker) -> None:
+        self._workers.discard(worker)
 
     def _job_completed(
         self,
@@ -1066,19 +1072,26 @@ class MainWindow(QMainWindow):
     def _plugin_specs(self) -> tuple[PluginSpec, ...]:
         plugins: list[PluginSpec] = []
         for row in range(self.plugin_table.rowCount()):
-            repository = self.plugin_table.item(row, 0).text()
-            branch = self.plugin_table.item(row, 1).text()
-            names = tuple(self.plugin_table.item(row, 2).text().split())
+            repository = self._table_item_text(self.plugin_table, row, 0, "插件项目地址")
+            branch = self._table_item_text(self.plugin_table, row, 1, "插件分支")
+            names = tuple(self._table_item_text(self.plugin_table, row, 2, "插件名").split())
             plugins.append(PluginSpec(repository, branch, names))
         return tuple(plugins)
 
     def _prebuilt_specs(self) -> tuple[PrebuiltPackageSpec, ...]:
         packages: list[PrebuiltPackageSpec] = []
         for row in range(self.prebuilt_table.rowCount()):
-            filename = self.prebuilt_table.item(row, 0).text()
-            digest = self.prebuilt_table.item(row, 2).text()
+            filename = self._table_item_text(self.prebuilt_table, row, 0, "预编译包文件名")
+            digest = self._table_item_text(self.prebuilt_table, row, 2, "预编译包 SHA256")
             packages.append(PrebuiltPackageSpec(filename, digest))
         return tuple(packages)
+
+    @staticmethod
+    def _table_item_text(table: QTableWidget, row: int, column: int, label: str) -> str:
+        item = table.item(row, column)
+        if item is None:
+            raise ValidationError(f"{label}第 {row + 1} 行为空。")
+        return item.text()
 
     def add_plugin(self) -> None:
         repository = self.plugin_repository_edit.text().strip()
@@ -1542,14 +1555,20 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.startup_timer.stop()
-        worker = self.worker
-        if worker is not None and worker.isRunning():
-            worker.cancel()
-            if not worker.wait(5000):
+        workers = tuple(self._workers)
+        for worker in workers:
+            if worker.isRunning():
+                worker.cancel()
+        for worker in workers:
+            if worker.isRunning() and not worker.wait(5000):
                 self.set_step("正在取消当前操作")
                 event.ignore()
                 return
         self.install_timer.stop()
+        for sizer_name in ("environment_sizer", "plugin_sizer", "prebuilt_sizer"):
+            sizer = getattr(self, sizer_name, None)
+            if sizer is not None:
+                sizer.dispose()
         event.accept()
 
 

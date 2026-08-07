@@ -33,3 +33,15 @@ class ScriptTests(unittest.TestCase):
             with self.assertRaisesRegex(ScriptError, "语法校验失败"):
                 stage_build_script(source, staged)
             self.assertFalse(any(path for path in staged.iterdir() if not path.name.startswith(".")))
+
+    def test_staging_directory_cannot_be_a_symbolic_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "Settings.sh"
+            source.write_text("#!/bin/bash\nprintf 'ok\\n'\n", encoding="ascii")
+            real_staging = root / "real-staging"
+            real_staging.mkdir()
+            linked_staging = root / "linked-staging"
+            linked_staging.symlink_to(real_staging, target_is_directory=True)
+            with self.assertRaisesRegex(ScriptError, "暂存目录不能是符号链接"):
+                stage_build_script(source, linked_staging)

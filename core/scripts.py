@@ -64,7 +64,10 @@ def stage_build_script(source: Path, destination: Path) -> ScriptSpec:
     if not bash:
         raise ScriptError("未找到 bash，无法校验脚本语法。")
 
-    destination = destination.expanduser().resolve()
+    raw_destination = destination.expanduser()
+    if raw_destination.is_symlink():
+        raise ScriptError("脚本暂存目录不能是符号链接。")
+    destination = raw_destination.resolve()
     try:
         destination.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
@@ -120,7 +123,10 @@ def stage_build_script(source: Path, destination: Path) -> ScriptSpec:
 def verify_staged_script(directory: Path, script: ScriptSpec) -> Path:
     """Return an executable staged script after path and digest validation."""
 
-    directory = directory.expanduser().resolve()
+    raw_directory = directory.expanduser()
+    if raw_directory.is_symlink():
+        raise ScriptError("自定义脚本暂存目录不能是符号链接。")
+    directory = raw_directory.resolve()
     raw_candidate = directory / script.filename
     candidate = raw_candidate.resolve()
     if (

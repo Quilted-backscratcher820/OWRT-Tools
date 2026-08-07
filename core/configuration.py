@@ -24,6 +24,7 @@ BUILD_SETTINGS_FILE = "build-settings.json"
 BUILD_SETTINGS_FORMAT = "openwrt-build-settings"
 BUILD_SETTINGS_VERSION = 1
 MAX_CONFIG_SIZE = 16 * 1024 * 1024
+MAX_METADATA_SIZE = 1 * 1024 * 1024
 
 _ASSIGNMENT = re.compile(r'^CONFIG_[A-Za-z0-9_-]+=(?:y|m|n|"[^"\n]*"|[^\s]+)$')
 _NOT_SET = re.compile(r"^# CONFIG_[A-Za-z0-9_-]+ is not set$")
@@ -135,7 +136,11 @@ def _require_strings(value: object, label: str) -> tuple[str, ...]:
 
 def _read_metadata(path: Path) -> BuildSpec:
     try:
+        if path.stat().st_size > MAX_METADATA_SIZE:
+            raise ConfigurationError("工具配置元数据超过 1 MiB，拒绝导入。")
         document = json.loads(path.read_text(encoding="utf-8"))
+    except ConfigurationError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ConfigurationError(f"无法读取工具配置元数据：{path}: {exc}") from exc
     root = _require_mapping(document, "工具配置")

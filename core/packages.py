@@ -56,7 +56,10 @@ def stage_prebuilt_package(source: Path, destination: Path) -> PrebuiltPackageSp
     if status.st_size > MAX_PACKAGE_SIZE:
         raise PrebuiltPackageError("预编译软件包超过 512 MiB，拒绝导入。")
 
-    destination = destination.expanduser().resolve()
+    raw_destination = destination.expanduser()
+    if raw_destination.is_symlink():
+        raise PrebuiltPackageError("预编译软件包暂存目录不能是符号链接。")
+    destination = raw_destination.resolve()
     try:
         destination.mkdir(parents=True, exist_ok=True)
         digest = package_sha256(source)
@@ -95,7 +98,10 @@ def stage_prebuilt_package(source: Path, destination: Path) -> PrebuiltPackageSp
 def verify_staged_package(directory: Path, package: PrebuiltPackageSpec) -> Path:
     """Return a verified staged archive, rejecting path escape and later modifications."""
 
-    directory = directory.expanduser().resolve()
+    raw_directory = directory.expanduser()
+    if raw_directory.is_symlink():
+        raise PrebuiltPackageError("预编译软件包暂存目录不能是符号链接。")
+    directory = raw_directory.resolve()
     raw_candidate = directory / package.filename
     candidate = raw_candidate.resolve()
     if (

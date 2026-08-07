@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -17,9 +17,12 @@ import signal
 import subprocess
 import tarfile
 import tempfile
-from typing import Any
+import time
+from typing import Any, TextIO, cast
 
 from .configuration import BUILD_SETTINGS_FILE, serialize_build_settings
+from .copying import MaterializedCopyError, copy_materialized_tree
+from .defaults import SourceDefaultsError, apply_source_defaults
 from .logs import timestamp_log_text
 from .models import BuildSpec, PluginSpec, PrebuiltPackageSpec, ProjectSpec, ScriptSpec
 from .packages import PrebuiltPackageError, stage_prebuilt_package, verify_staged_package
@@ -60,6 +63,14 @@ def timestamp() -> str:
 
 def current_date() -> str:
     return datetime.now().strftime("%Y%m%d")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
@@ -119,17 +130,27 @@ class CommandRunner:
         reader = selectors.DefaultSelector()
         reader.register(process.stdout, selectors.EVENT_READ)
         cancelled = False
+        kill_deadline: float | None = None
         try:
             while process.poll() is None:
                 if self.cancelled() and not cancelled:
                     cancelled = True
+                    kill_deadline = time.monotonic() + 5
                     self.log("[取消] 正在终止当前命令。")
                     try:
                         os.killpg(process.pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
+                elif cancelled and kill_deadline is not None and time.monotonic() >= kill_deadline:
+                    self.log("[取消] 命令未及时退出，正在强制终止。")
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    kill_deadline = None
                 for key, _ in reader.select(timeout=0.25):
-                    line = key.fileobj.readline()
+                    stream = cast(TextIO, key.fileobj)
+                    line = stream.readline()
                     if line:
                         self.log(line.rstrip("\n"))
             for line in process.stdout:
@@ -200,7 +221,7 @@ class Workflow:
             self._log_file.flush()
 
     @contextmanager
-    def operation_log(self, platform: str) -> Iterable[Path]:
+    def operation_log(self, platform: str) -> Iterator[Path]:
         safe_platform = re.sub(r"[^A-Za-z0-9._-]+", "_", platform) or "operation"
         logs_root = self.logs_root
         try:
@@ -284,7 +305,7 @@ class Workflow:
             return []
         projects: list[ProjectSpec] = []
         for directory in sorted(self.projects_root.iterdir()):
-            if directory.is_dir() and (directory / ".git").is_dir():
+            if directory.is_dir() and not directory.is_symlink() and (directory / ".git").is_dir():
                 try:
                     projects.append(self._read_project(directory))
                 except WorkflowError:
@@ -294,7 +315,7 @@ class Workflow:
     def get_project(self, name: str) -> ProjectSpec:
         name = require_component(name, "项目名")
         directory = self.projects_root / name
-        if not directory.is_dir():
+        if not directory.is_dir() or directory.is_symlink():
             raise WorkflowError(f"项目不存在：{name}")
         return self._read_project(directory)
 
@@ -304,7 +325,7 @@ class Workflow:
         project_name = require_component(name, "项目名") if name.strip() else source_name(repository)
         directory = self.projects_root / project_name
         self.projects_root.mkdir(parents=True, exist_ok=True)
-        if directory.exists():
+        if os.path.lexists(directory):
             raise WorkflowError(f"项目目录已存在，不能覆盖：{directory}")
         try:
             with self.operation_log(project_name):
@@ -321,8 +342,8 @@ class Workflow:
                 atomic_write(self._project_metadata_path(directory), json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
                 self._write("[完成] 项目克隆和 feeds 更新完成。")
         except Exception:
-            if directory.exists() and not self._project_metadata_path(directory).is_file():
-                shutil.rmtree(directory)
+            if os.path.lexists(directory):
+                self._remove_path(directory)
             raise
         return ProjectSpec(project_name, repository, branch, directory)
 
@@ -344,7 +365,12 @@ class Workflow:
                 matches.append(parent)
         return matches
 
-    def _remove_duplicate_packages(self, project: ProjectSpec, package_name: str, keep: Path) -> None:
+    def _duplicate_package_paths(
+        self,
+        project: ProjectSpec,
+        package_name: str,
+        keep: Path,
+    ) -> list[Path]:
         keep = keep.resolve()
         project_root = project.directory.expanduser().resolve()
         roots = (project.directory / "package", project.directory / "feeds")
@@ -359,11 +385,32 @@ class Workflow:
                 safe_duplicates.add(candidate)
             else:
                 self._write(f"[去重] 跳过项目目录之外的插件目录：{candidate}")
+        result: list[Path] = []
         for candidate in sorted(safe_duplicates, key=lambda item: len(item.parts), reverse=True):
             if candidate == keep or keep.is_relative_to(candidate):
                 continue
+            result.append(candidate)
+        return result
+
+    def _remove_duplicate_packages(
+        self,
+        project: ProjectSpec,
+        package_name: str,
+        keep: Path,
+        preserve_root: Path | None = None,
+    ) -> list[tuple[Path, Path]]:
+        moved: list[tuple[Path, Path]] = []
+        for candidate in self._duplicate_package_paths(project, package_name, keep):
             self._write(f"[去重] 删除同名插件目录：{candidate}")
-            shutil.rmtree(candidate)
+            if preserve_root is None:
+                self._remove_path(candidate)
+                continue
+            relative = candidate.relative_to(project.directory.expanduser().resolve())
+            previous = preserve_root / relative
+            previous.parent.mkdir(parents=True, exist_ok=True)
+            candidate.replace(previous)
+            moved.append((candidate, previous))
+        return moved
 
     def _unique_package_candidate(
         self,
@@ -424,38 +471,105 @@ class Workflow:
             return ()
         package_root = project.directory / "package" / "custom"
         staging_root = project.directory / self.INTERNAL_DIR / "staging"
+        if package_root.is_symlink() or staging_root.is_symlink():
+            raise WorkflowError("本工具的插件目录不能是符号链接。")
         package_root.mkdir(parents=True, exist_ok=True)
         staging_root.mkdir(parents=True, exist_ok=True)
         installed: list[PluginSpec] = []
-        for index, plugin in enumerate(plugins, 1):
-            self._assert_not_cancelled()
-            repository = require_repository(plugin.repository, "插件项目地址")
-            branch = require_branch(plugin.branch, "插件分支")
-            stage = staging_root / f"plugin-{index}-{source_name(repository)}"
-            if stage.exists():
-                shutil.rmtree(stage)
+        prepared: list[tuple[str, Path, str, str]] = []
+        seen_packages: dict[str, str] = {}
+        transaction = Path(tempfile.mkdtemp(prefix="plugin-install-", dir=staging_root))
+        prepared_root = transaction / "prepared"
+        prepared_root.mkdir()
+        try:
+            for index, plugin in enumerate(plugins, 1):
+                self._assert_not_cancelled()
+                repository = require_repository(plugin.repository, "插件项目地址")
+                branch = require_branch(plugin.branch, "插件分支")
+                stage = staging_root / f"plugin-{index}-{source_name(repository)}"
+                if os.path.lexists(stage):
+                    self._remove_path(stage)
+                try:
+                    self.step(f"下载自定义插件 {index}/{len(plugins)}")
+                    self.runner.run(
+                        (
+                            "git",
+                            "clone",
+                            "--depth",
+                            "1",
+                            "--single-branch",
+                            "--branch",
+                            branch,
+                            repository,
+                            str(stage),
+                        ),
+                        project.directory,
+                    )
+                    resolved = self._resolve_plugin_packages(stage, plugin.package_names)
+                    resolved_names: list[str] = []
+                    for package_name, source in resolved:
+                        previous_repository = seen_packages.get(package_name)
+                        if previous_repository is not None:
+                            raise WorkflowError(
+                                f"插件包 {package_name} 同时来自 {previous_repository} 和 "
+                                f"{repository}，请只保留一个来源。"
+                            )
+                        materialized = prepared_root / package_name
+                        try:
+                            copy_materialized_tree(source, materialized, stage)
+                        except MaterializedCopyError as exc:
+                            raise WorkflowError(f"插件实体复制失败：{exc}") from exc
+                        seen_packages[package_name] = repository
+                        resolved_names.append(package_name)
+                        prepared.append((package_name, materialized, repository, branch))
+                    installed.append(PluginSpec(repository, branch, tuple(resolved_names)))
+                finally:
+                    if os.path.lexists(stage):
+                        self._remove_path(stage)
+
+            previous_root = transaction / "previous"
+            previous_root.mkdir()
+            moved_previous: list[tuple[Path, Path]] = []
+            moved_duplicates: list[tuple[Path, Path]] = []
+            placed: list[Path] = []
             try:
-                self.step(f"下载自定义插件 {index}/{len(plugins)}")
-                self.runner.run(
-                    ("git", "clone", "--depth", "1", "--single-branch", "--branch", branch, repository, str(stage)),
-                    project.directory,
-                )
-                resolved = self._resolve_plugin_packages(stage, plugin.package_names)
-                for package_name, source in resolved:
+                for package_name, materialized, repository, branch in prepared:
+                    self._assert_not_cancelled()
                     destination = package_root / package_name
-                    if destination.exists():
+                    if os.path.lexists(destination):
                         self._write(f"[插件] 替换受本工具管理的插件：{destination}")
-                        shutil.rmtree(destination)
-                    shutil.copytree(source, destination, symlinks=True)
-                    self._remove_duplicate_packages(project, package_name, destination)
+                        previous = previous_root / package_name
+                        destination.replace(previous)
+                        moved_previous.append((destination, previous))
+                    materialized.replace(destination)
+                    placed.append(destination)
+                    if destination.is_symlink() or not destination.is_dir():
+                        raise WorkflowError(f"插件未复制为普通目录：{destination}")
+                    moved_duplicates.extend(
+                        self._remove_duplicate_packages(
+                            project,
+                            package_name,
+                            destination,
+                            transaction / "duplicates",
+                        )
+                    )
                     self._write(f"[插件] 已安装 {package_name}：{repository}@{branch}")
-                installed.append(
-                    PluginSpec(repository, branch, tuple(name for name, _source in resolved))
-                )
-            finally:
-                if stage.exists():
-                    shutil.rmtree(stage)
-        return tuple(installed)
+            except Exception:
+                for destination in reversed(placed):
+                    if os.path.lexists(destination):
+                        self._remove_path(destination)
+                for destination, previous in reversed(moved_previous):
+                    if os.path.lexists(previous):
+                        previous.replace(destination)
+                for duplicate, previous in reversed(moved_duplicates):
+                    if os.path.lexists(previous):
+                        duplicate.parent.mkdir(parents=True, exist_ok=True)
+                        previous.replace(duplicate)
+                raise
+            return tuple(installed)
+        finally:
+            if os.path.lexists(transaction):
+                self._remove_path(transaction)
 
     def _deduplicate_installed_plugins(
         self,
@@ -468,12 +582,30 @@ class Workflow:
                 if keep.is_dir():
                     self._remove_duplicate_packages(project, package_name, keep)
 
-    def _write_settings_package(self, project: ProjectSpec, spec: BuildSpec) -> None:
-        """Put defaults in a tiny package instead of editing upstream source files."""
+    def _write_metadata_package(self, project: ProjectSpec, spec: BuildSpec) -> None:
+        """Install the internal build identifier without a boot-time defaults script."""
 
         package = project.directory / "package" / "custom" / "settings"
-        defaults = package / "files" / "etc" / "uci-defaults" / "99-builder-settings"
-        build_id_file = package / "files" / "etc" / "owrt-tools-build-id"
+        package_root = package.parent
+        if package_root.is_symlink() or package.is_symlink():
+            raise WorkflowError("本工具的编译元数据目录不能是符号链接。")
+        try:
+            package_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WorkflowError(f"无法创建编译元数据目录：{package_root}: {exc}") from exc
+        marker = package / ".owrt-tool-managed"
+        if marker.is_symlink():
+            raise WorkflowError("本工具的编译元数据标记不能是符号链接。")
+        if package.exists() and not marker.is_file():
+            makefile = package / "Makefile"
+            try:
+                legacy = makefile.is_file() and "PKG_NAME:=builder-settings" in makefile.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError as exc:
+                raise WorkflowError(f"无法检查编译元数据目录：{package}: {exc}") from exc
+            if not legacy:
+                raise WorkflowError(f"编译元数据目录已被其他内容占用：{package}")
         makefile = """include $(TOPDIR)/rules.mk
 
 PKG_NAME:=builder-settings
@@ -484,47 +616,77 @@ include $(INCLUDE_DIR)/package.mk
 define Package/builder-settings
   SECTION:=base
   CATEGORY:=Base system
-  TITLE:=OpenWrt Builder defaults
+  TITLE:=OpenWrt Builder metadata
 endef
 
 define Build/Compile
 endef
 
 define Package/builder-settings/install
-\t$(INSTALL_DIR) $(1)/etc/uci-defaults
-\t$(INSTALL_BIN) ./files/etc/uci-defaults/99-builder-settings $(1)/etc/uci-defaults/99-builder-settings
+\t$(INSTALL_DIR) $(1)/etc
 \t$(INSTALL_DATA) ./files/etc/owrt-tools-build-id $(1)/etc/owrt-tools-build-id
 endef
 
 $(eval $(call BuildPackage,builder-settings))
 """
-        import shlex
+        try:
+            temporary_root = Path(tempfile.mkdtemp(prefix=".builder-settings-", dir=package_root))
+        except OSError as exc:
+            raise WorkflowError(f"无法创建编译元数据暂存目录：{exc}") from exc
+        temporary_package = temporary_root / "settings"
+        try:
+            build_id_file = temporary_package / "files" / "etc" / "owrt-tools-build-id"
+            temporary_package.mkdir(parents=True)
+            atomic_write(temporary_package / "Makefile", makefile)
+            atomic_write(build_id_file, spec.build_id + "\n")
+            atomic_write(temporary_package / ".owrt-tool-managed", "managed by owrt_tool\n")
+            previous = temporary_root / "previous"
+            if os.path.lexists(package):
+                package.replace(previous)
+            try:
+                temporary_package.replace(package)
+            except OSError:
+                if os.path.lexists(previous):
+                    previous.replace(package)
+                raise
+        except OSError as exc:
+            raise WorkflowError(f"无法生成编译元数据目录：{package}: {exc}") from exc
+        finally:
+            if temporary_root.exists():
+                self._remove_path(temporary_root)
 
-        script = "\n".join(
-            (
-                "#!/bin/sh",
-                f"uci -q set system.@system[0].hostname={shlex.quote(spec.hostname)}",
-                f"uci -q set network.lan.ipaddr={shlex.quote(spec.ip_address)}",
-                f"uci -q set wireless.default_radio0.ssid={shlex.quote(spec.wifi_ssid)}",
-                "uci -q set wireless.default_radio0.encryption='psk2'",
-                f"uci -q set wireless.default_radio0.key={shlex.quote(spec.wifi_password)}",
-                "uci -q commit system",
-                "uci -q commit network",
-                "uci -q commit wireless",
-                "exit 0",
-                "",
+    def _apply_source_defaults(self, project: ProjectSpec, spec: BuildSpec) -> None:
+        try:
+            result = apply_source_defaults(
+                project.directory,
+                platform=spec.platform,
+                hostname=spec.hostname,
+                ip_address=spec.ip_address,
+                wifi_ssid=spec.wifi_ssid,
+                wifi_password=spec.wifi_password,
             )
+        except SourceDefaultsError as exc:
+            raise WorkflowError(f"直接修改默认网络设置失败：{exc}") from exc
+        wireless = "、".join(
+            str(path.relative_to(project.directory)) for path in result.wireless_files
         )
-        atomic_write(package / "Makefile", makefile)
-        atomic_write(defaults, script, mode=0o755)
-        atomic_write(build_id_file, spec.build_id + "\n")
+        self._write(
+            f"[设置] 已直接修改主机名和 LAN IP："
+            f"{result.config_generate.relative_to(project.directory)}"
+        )
+        self._write(f"[设置] 已直接修改 WiFi 账号和密码：{wireless}")
+        if result.luci_files:
+            self._write(f"[设置] 已同步修改 {len(result.luci_files)} 个 LuCI 重连地址文件。")
 
     def stage_prebuilt_package(self, project: ProjectSpec, source: Path) -> PrebuiltPackageSpec:
         """Copy one selected archive into the selected project's private storage."""
 
         project_root = project.directory.expanduser().resolve()
-        staging = (project_root / self.INTERNAL_DIR / "prebuilt").resolve()
-        if not staging.is_relative_to(project_root):
+        managed_root = project_root / self.INTERNAL_DIR
+        staging = managed_root / "prebuilt"
+        if managed_root.is_symlink() or staging.is_symlink():
+            raise WorkflowError("预编译软件包暂存目录不能是符号链接。")
+        if not staging.resolve().is_relative_to(project_root):
             raise WorkflowError("预编译软件包目录不能位于项目目录之外。")
         try:
             package = stage_prebuilt_package(source, staging)
@@ -537,8 +699,11 @@ $(eval $(call BuildPackage,builder-settings))
         """Prepare one selected script below the project's private storage."""
 
         project_root = project.directory.expanduser().resolve()
-        staging = (project_root / self.INTERNAL_DIR / "scripts").resolve()
-        if not staging.is_relative_to(project_root):
+        managed_root = project_root / self.INTERNAL_DIR
+        staging = managed_root / "scripts"
+        if managed_root.is_symlink() or staging.is_symlink():
+            raise WorkflowError("自定义脚本暂存目录不能是符号链接。")
+        if not staging.resolve().is_relative_to(project_root):
             raise WorkflowError("自定义脚本目录不能位于项目目录之外。")
         try:
             script = stage_build_script(source, staging)
@@ -593,7 +758,8 @@ $(eval $(call BuildPackage,builder-settings))
                     f"(luciversion || '') + (' / {build_id}')", content
                 )
                 if replacements:
-                    atomic_write(path, updated, mode=path.stat().st_mode & 0o777)
+                    target = path.resolve() if path.is_symlink() else path
+                    atomic_write(target, updated, mode=target.stat().st_mode & 0o777)
                     changed += replacements
             except (OSError, UnicodeError) as exc:
                 raise WorkflowError(f"无法写入编译标识：{path}: {exc}") from exc
@@ -610,26 +776,39 @@ $(eval $(call BuildPackage,builder-settings))
 
         package = project.directory / "package" / "custom" / "builder-prebuilt"
         marker = package / ".owrt-tool-managed"
+        package_root = package.parent
+        if package_root.is_symlink() or package.is_symlink():
+            raise WorkflowError(f"本工具的预编译软件包目录不能是符号链接：{package}")
+        if marker.is_symlink():
+            raise WorkflowError(f"本工具的预编译软件包标记不能是符号链接：{marker}")
+        try:
+            package_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WorkflowError(f"无法创建预编译软件包目录：{package_root}: {exc}") from exc
         if not spec.prebuilt_packages:
             if marker.is_file():
-                shutil.rmtree(package)
+                self._remove_path(package)
                 self._write("[预编译包] 已移除不再使用的集成包。")
             return
-        if package.exists() and (package.is_symlink() or not marker.is_file()):
+        if os.path.lexists(package) and not marker.is_file():
             raise WorkflowError(f"预编译软件包目录已被其他内容占用：{package}")
-        if package.exists():
-            shutil.rmtree(package)
 
         staged_root = project.directory / self.INTERNAL_DIR / "prebuilt"
-        files = package / "files"
-        package.mkdir(parents=True, exist_ok=True)
-        files.mkdir()
+        verified: list[tuple[PrebuiltPackageSpec, Path]] = []
+        for entry in spec.prebuilt_packages:
+            try:
+                verified.append((entry, verify_staged_package(staged_root, entry)))
+            except PrebuiltPackageError as exc:
+                raise WorkflowError(str(exc)) from exc
         try:
-            for entry in spec.prebuilt_packages:
-                try:
-                    source = verify_staged_package(staged_root, entry)
-                except PrebuiltPackageError as exc:
-                    raise WorkflowError(str(exc)) from exc
+            temporary_root = Path(tempfile.mkdtemp(prefix=".builder-prebuilt-", dir=package_root))
+        except OSError as exc:
+            raise WorkflowError(f"无法创建预编译软件包暂存目录：{exc}") from exc
+        temporary_package = temporary_root / "builder-prebuilt"
+        try:
+            files = temporary_package / "files"
+            files.mkdir(parents=True)
+            for entry, source in verified:
                 shutil.copy2(source, files / entry.filename)
             makefile = """include $(TOPDIR)/rules.mk
 
@@ -674,16 +853,22 @@ endef
 
 $(eval $(call BuildPackage,builder-prebuilt))
 """
-            atomic_write(package / "Makefile", makefile)
-            atomic_write(marker, "managed by owrt_tool\n")
-        except WorkflowError:
-            if package.exists():
-                shutil.rmtree(package)
-            raise
+            atomic_write(temporary_package / "Makefile", makefile)
+            atomic_write(temporary_package / ".owrt-tool-managed", "managed by owrt_tool\n")
+            previous = temporary_root / "previous"
+            if os.path.lexists(package):
+                package.replace(previous)
+            try:
+                temporary_package.replace(package)
+            except OSError:
+                if os.path.lexists(previous):
+                    previous.replace(package)
+                raise
         except OSError as exc:
-            if package.exists():
-                shutil.rmtree(package)
             raise WorkflowError(f"无法生成预编译软件包集成包：{exc}") from exc
+        finally:
+            if temporary_root.exists():
+                self._remove_path(temporary_root)
         self._write(f"[预编译包] 已准备 {len(spec.prebuilt_packages)} 个软件包用于固件集成。")
 
     def _write_initial_config(
@@ -737,15 +922,21 @@ $(eval $(call BuildPackage,builder-prebuilt))
         backup_root = (spec.backup_directory or self.root / "backup_firmware").expanduser().resolve()
         if backup_root == output or backup_root.is_relative_to(output):
             raise WorkflowError("固件备份目录不能位于固件输出目录内。")
-        backup_root.mkdir(parents=True, exist_ok=True)
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WorkflowError(f"无法创建固件备份目录：{backup_root}: {exc}") from exc
         destination = backup_root / f"{platform_key(spec.platform)}-{stamp}"
         suffix = 1
         while destination.exists():
             destination = backup_root / f"{platform_key(spec.platform)}-{stamp}-{suffix}"
             suffix += 1
-        temporary = Path(
-            tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=backup_root)
-        )
+        try:
+            temporary = Path(
+                tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=backup_root)
+            )
+        except OSError as exc:
+            raise WorkflowError(f"无法创建固件备份暂存目录：{exc}") from exc
         try:
             shutil.copytree(output, temporary / "targets")
             shutil.copytree(snapshot, temporary / "config")
@@ -753,16 +944,14 @@ $(eval $(call BuildPackage,builder-prebuilt))
             sums: list[str] = []
             for path in sorted(temporary.rglob("*")):
                 if path.is_file():
-                    digest = hashlib.sha256()
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    sums.append(f"{digest.hexdigest()}  {path.relative_to(temporary)}")
+                    sums.append(f"{sha256_file(path)}  {path.relative_to(temporary)}")
             atomic_write(temporary / "SHA256SUMS", "\n".join(sums) + "\n")
             temporary.replace(destination)
+        except OSError as exc:
+            raise WorkflowError(f"无法生成固件备份：{exc}") from exc
         finally:
             if temporary.exists():
-                shutil.rmtree(temporary)
+                self._remove_path(temporary)
         self.backup_output_directory = destination
         self._write(f"[备份] 固件已保存：{destination}")
         candidates = sorted(
@@ -771,7 +960,10 @@ $(eval $(call BuildPackage,builder-prebuilt))
             reverse=True,
         )
         for old in candidates[spec.backup_retention :]:
-            shutil.rmtree(old)
+            try:
+                self._remove_path(old)
+            except OSError as exc:
+                raise WorkflowError(f"无法删除旧固件备份：{old}: {exc}") from exc
             self._write(f"[备份] 按留存数删除旧备份：{old}")
         return destination
 
@@ -780,10 +972,17 @@ $(eval $(call BuildPackage,builder-prebuilt))
 
         validate_build_spec(spec)
         forced_config = self._forced_config()
-        build_directory = (spec.build_directory or project.directory).expanduser().resolve()
+        raw_build_directory = (spec.build_directory or project.directory).expanduser()
+        if raw_build_directory.is_symlink():
+            raise WorkflowError("编译目录不能是符号链接，请选择正常目录。")
+        build_directory = raw_build_directory.resolve()
+        if project.directory.is_symlink():
+            raise WorkflowError("项目源码目录不能是符号链接，请使用实际目录。")
         project = replace(project, directory=build_directory)
         if not (project.directory / "scripts" / "feeds").is_file():
             raise WorkflowError("项目不是可编译的 OpenWrt 源码树。")
+        if (project.directory / self.INTERNAL_DIR).is_symlink():
+            raise WorkflowError("本工具的项目数据目录 .builder 不能是符号链接。")
         base_stamp = timestamp()
         spec = replace(spec, build_id=f"OWRT-Tools-{base_stamp}")
         stamp = base_stamp
@@ -827,8 +1026,8 @@ $(eval $(call BuildPackage,builder-prebuilt))
             resolved_plugins = self._install_plugins(project, spec.plugins)
             spec = replace(spec, plugins=resolved_plugins)
             self._assert_not_cancelled()
-            self.step("写入默认网络设置")
-            self._write_settings_package(project, spec)
+            self.step("准备编译元数据")
+            self._write_metadata_package(project, spec)
             self.step("准备预编译软件包")
             self._write_prebuilt_package(project, spec)
             self._write_initial_config(project, spec, stamp, forced_config)
@@ -843,9 +1042,11 @@ $(eval $(call BuildPackage,builder-prebuilt))
             if self._feeds_need_refresh(project.directory, date_key):
                 self._write(f"[feeds] 日期变更或缺少记录，更新当日 feeds：{date_key}")
                 self._refresh_feeds(project.directory, date_key)
-                self._deduplicate_installed_plugins(project, spec.plugins)
             else:
                 self._write(f"[feeds] 当日已更新，跳过重复更新：{date_key}")
+            self._deduplicate_installed_plugins(project, spec.plugins)
+            self.step("直接修改默认网络设置")
+            self._apply_source_defaults(project, spec)
             self._apply_forced_config(project.directory, forced_config)
             self._write_build_identifier(project, spec.build_id)
             self.step("生成最终配置")
@@ -885,18 +1086,31 @@ $(eval $(call BuildPackage,builder-prebuilt))
     @staticmethod
     def _toolchain_entries(project: ProjectSpec) -> list[Path]:
         project_root = project.directory.expanduser().resolve()
-        staging = (project_root / "staging_dir").resolve()
+        ccache = project_root / ".ccache"
+        if ccache.is_symlink():
+            raise WorkflowError("项目 .ccache 不能是符号链接，请使用实际目录。")
+        staging_root = project_root / "staging_dir"
+        if staging_root.is_symlink():
+            raise WorkflowError("项目 staging_dir 不能是符号链接，请使用实际目录。")
+        staging = staging_root.resolve()
         if not staging.is_relative_to(project_root):
             raise WorkflowError("staging_dir 不能指向项目目录之外。")
-        if not staging.is_dir():
-            return []
-        return [
-            path
-            for path in staging.iterdir()
-            if path.is_dir()
-            and not path.is_symlink()
-            and (path.name.startswith("toolchain-") or path.name in {"host", "hostpkg"})
-        ]
+        entries = [ccache] if ccache.is_dir() else []
+        if staging.is_dir():
+            entries.extend(
+                path
+                for path in staging.iterdir()
+                if path.is_dir()
+                and not path.is_symlink()
+                and (path.name.startswith("toolchain-") or path.name in {"host", "hostpkg"})
+            )
+        return entries
+
+    @staticmethod
+    def _cache_archive_name(project_root: Path, entry: Path) -> Path:
+        if entry == project_root / ".ccache":
+            return Path(".ccache")
+        return Path("staging_dir") / entry.name
 
     def _toolchain_key(self, project: ProjectSpec, platform: str) -> str:
         return f"{project.name}--{platform_key(platform)}"
@@ -929,7 +1143,9 @@ $(eval $(call BuildPackage,builder-prebuilt))
         key = self._toolchain_key(project, platform)
         entries = self._toolchain_entries(project)
         if not entries:
-            raise WorkflowError("未找到 staging_dir/toolchain-*；请至少成功编译一次。")
+            raise WorkflowError(
+                "未找到 .ccache 或 staging_dir/host*/toolchain-*；请至少成功编译一次。"
+            )
         self.toolchains_root.mkdir(parents=True, exist_ok=True)
         base_stamp = timestamp()
         base = f"{key}-{base_stamp}"
@@ -951,17 +1167,27 @@ $(eval $(call BuildPackage,builder-prebuilt))
             with tarfile.open(temporary, "w:gz") as handle:
                 for entry in entries:
                     self._assert_not_cancelled()
-                    handle.add(entry, arcname=str(Path("staging_dir") / entry.name), recursive=True)
+                    handle.add(
+                        entry,
+                        arcname=str(self._cache_archive_name(project.directory.expanduser().resolve(), entry)),
+                        recursive=True,
+                    )
             temporary.replace(archive)
+            archive_sha256 = sha256_file(archive)
             metadata = {
                 "project_name": project.name,
                 "repository": project.repository,
                 "branch": project.branch,
                 "platform": platform_key(platform),
                 "archive": archive.name,
+                "sha256": archive_sha256,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
-            atomic_write(manifest, json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+            try:
+                atomic_write(manifest, json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+            except OSError:
+                archive.unlink(missing_ok=True)
+                raise
             self._write("[完成] 工具链保存完成。")
         finally:
             temporary.unlink(missing_ok=True)
@@ -992,7 +1218,7 @@ $(eval $(call BuildPackage,builder-prebuilt))
                 else:
                     parts.append(part)
             else:
-                if parts and parts[0] == "staging_dir":
+                if parts and parts[0] in {"staging_dir", ".ccache"}:
                     return True
         return False
 
@@ -1000,7 +1226,12 @@ $(eval $(call BuildPackage,builder-prebuilt))
     def _safe_extract(handle: tarfile.TarFile, destination: Path) -> None:
         for member in handle.getmembers():
             path = Path(member.name)
-            if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "staging_dir":
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or not path.parts
+                or path.parts[0] not in {"staging_dir", ".ccache"}
+            ):
                 raise WorkflowError(f"工具链归档包含不安全路径：{member.name}")
             if member.issym() or member.islnk():
                 if not Workflow._safe_link_target(member):
@@ -1016,7 +1247,56 @@ $(eval $(call BuildPackage,builder-prebuilt))
         if path.is_symlink() or not path.is_dir():
             path.unlink(missing_ok=True)
         else:
-            shutil.rmtree(path)
+            def repair(function: Callable[[str], object], name: str, _error: object) -> None:
+                candidate = Path(name)
+                for item in (candidate.parent, candidate):
+                    if item.exists() and not item.is_symlink():
+                        item.chmod(item.stat().st_mode | 0o700)
+                function(name)
+
+            shutil.rmtree(path, onerror=repair)
+
+    def _refresh_openwrt_cache_markers(self, project: ProjectSpec) -> None:
+        """Refresh the native OpenWrt markers after restoring build caches.
+
+        OpenWrt's CI cache workflow refreshes the non-target stamp files and
+        creates ``tmp/.build``.  Without those updates, make can treat a
+        restored toolchain/host cache as stale and rebuild it unnecessarily.
+        """
+
+        project_root = project.directory.expanduser().resolve()
+        staging = project_root / "staging_dir"
+        if staging.is_symlink():
+            raise WorkflowError("项目 staging_dir 不能是符号链接。")
+        refreshed = 0
+        if staging.is_dir():
+            try:
+                stamp_dirs = sorted(staging.rglob("stamp"))
+                for stamp in stamp_dirs:
+                    relative = stamp.relative_to(staging)
+                    if not stamp.is_dir() or stamp.is_symlink() or any(
+                        "target" in part for part in relative.parts
+                    ):
+                        continue
+                    for path in sorted(stamp.rglob("*")):
+                        if path.is_file() and not path.is_symlink():
+                            os.utime(path, None)
+                            refreshed += 1
+            except OSError as exc:
+                raise WorkflowError(f"无法刷新 OpenWrt 工具链缓存时间戳：{exc}") from exc
+
+        temporary = project_root / "tmp"
+        if temporary.is_symlink():
+            raise WorkflowError("项目 tmp 目录不能是符号链接。")
+        marker = temporary / ".build"
+        if marker.is_symlink():
+            raise WorkflowError("项目 tmp/.build 不能是符号链接。")
+        try:
+            atomic_write(marker, "1\n")
+        except OSError as exc:
+            raise WorkflowError(f"无法写入 OpenWrt 缓存标识 tmp/.build：{exc}") from exc
+        self._write(f"[缓存] 已刷新 {refreshed} 个 staging_dir stamp 文件。")
+        self._write("[缓存] 已写入 OpenWrt 缓存标识：tmp/.build=1")
 
     def _apply_toolchain(self, project: ProjectSpec, platform: str, manifest: Path) -> None:
         manifest = manifest.expanduser().resolve()
@@ -1028,6 +1308,7 @@ $(eval $(call BuildPackage,builder-prebuilt))
             expected_project = metadata["project_name"]
             expected_platform = metadata["platform"]
             archive_name = metadata["archive"]
+            expected_sha256 = metadata.get("sha256")
             if not all(isinstance(value, str) for value in (expected_project, expected_platform, archive_name)):
                 raise TypeError("工具链项目、平台和归档名必须是文本")
             if Path(archive_name).name != archive_name:
@@ -1035,34 +1316,57 @@ $(eval $(call BuildPackage,builder-prebuilt))
             archive = (manifest.parent / archive_name).resolve()
             if not archive.is_relative_to(toolchains_root):
                 raise WorkflowError("工具链归档必须位于工具链目录内。")
+            if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise WorkflowError("工具链清单中的 SHA-256 无效。")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WorkflowError(f"工具链清单无效：{exc}") from exc
         if expected_project != project.name or expected_platform != platform_key(platform):
             raise WorkflowError("工具链项目名或平台名不匹配，已拒绝应用。")
         if not archive.is_file():
             raise WorkflowError(f"工具链归档不存在：{archive}")
+        try:
+            actual_sha256 = sha256_file(archive)
+        except OSError as exc:
+            raise WorkflowError(f"无法读取工具链归档：{archive}: {exc}") from exc
+        if actual_sha256 != expected_sha256:
+            raise WorkflowError("工具链归档 SHA-256 校验失败，已拒绝应用。")
         self.step("校验工具链")
         with tempfile.TemporaryDirectory(prefix="builder-toolchain-", dir=self.root) as temporary:
             temporary_path = Path(temporary)
             with tarfile.open(archive, "r:gz") as handle:
                 self._safe_extract(handle, temporary_path)
             staged = temporary_path / "staging_dir"
-            entries = list(staged.iterdir()) if staged.is_dir() else []
+            cache = temporary_path / ".ccache"
+            if staged.is_symlink() or cache.is_symlink():
+                raise WorkflowError("工具链归档根目录不能是符号链接。")
+            entries: list[tuple[Path, Path]] = []
+            if cache.exists():
+                if not cache.is_dir():
+                    raise WorkflowError("工具链归档中的 .ccache 必须是目录。")
+                entries.append((cache, project.directory / ".ccache"))
+            staged_entries = list(staged.iterdir()) if staged.is_dir() else []
             invalid_entries = [
                 path
-                for path in entries
+                for path in staged_entries
                 if not path.is_dir() or path.is_symlink()
                 or (not path.name.startswith("toolchain-") and path.name not in {"host", "hostpkg"})
             ]
             if invalid_entries:
                 joined = "、".join(path.name for path in invalid_entries)
                 raise WorkflowError(f"工具链归档包含不允许的目录：{joined}")
+            entries.extend(
+                (entry, project.directory / "staging_dir" / entry.name)
+                for entry in staged_entries
+            )
             if not entries:
-                raise WorkflowError("工具链归档不包含 staging_dir 内容。")
+                raise WorkflowError("工具链归档不包含 .ccache 或 staging_dir 缓存内容。")
             target_staging = project.directory / "staging_dir"
             if target_staging.is_symlink():
                 raise WorkflowError("项目 staging_dir 不能是符号链接。")
-            target_staging.mkdir(parents=True, exist_ok=True)
+            if staged_entries:
+                target_staging.mkdir(parents=True, exist_ok=True)
+            if (project.directory / ".ccache").is_symlink():
+                raise WorkflowError("项目 .ccache 不能是符号链接。")
             backup = project.directory / self.INTERNAL_DIR / "toolchains" / timestamp()
             suffix = 1
             while backup.exists():
@@ -1072,18 +1376,20 @@ $(eval $(call BuildPackage,builder-prebuilt))
             moved: list[tuple[Path, Path]] = []
             touched: list[Path] = []
             try:
-                for entry in entries:
+                for entry, target in entries:
                     self._assert_not_cancelled()
-                    target = target_staging / entry.name
                     if os.path.lexists(target):
                         backup.mkdir(parents=True, exist_ok=True)
-                        old = backup / entry.name
+                        old = backup / target.relative_to(project.directory)
+                        old.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(target), str(old))
                         moved.append((target, old))
                         self._write(f"[工具链] 已备份旧目录：{old}")
                     touched.append(target)
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(entry, target, symlinks=False)
                     self._write(f"[工具链] 已应用：{target}")
+                self._refresh_openwrt_cache_markers(project)
             except Exception:
                 for target in reversed(touched):
                     if os.path.lexists(target):

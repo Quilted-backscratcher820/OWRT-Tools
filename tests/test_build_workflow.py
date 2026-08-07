@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from core.configuration import BUILD_SETTINGS_FILE, load_build_config
 from core.models import BuildSpec, ProjectSpec
-from core.workflow import Workflow
+from core.workflow import Workflow, WorkflowError
 
 
 FORCED_CONFIG_TEXT = (
@@ -30,9 +30,73 @@ def prepare_build_tree(root: Path, project: Path) -> None:
         encoding="ascii",
     )
     feeds.chmod(0o755)
+    config_generate = project / "package" / "base-files" / "files" / "bin" / "config_generate"
+    config_generate.parent.mkdir(parents=True)
+    config_generate.write_text(
+        "lan) ipad=${ipaddr:-\"192.168.1.1\"} ;;\n"
+        "uci -q set system.@system[-1].hostname='OpenWrt'\n",
+        encoding="utf-8",
+    )
+    wireless = (
+        project
+        / "package"
+        / "network"
+        / "config"
+        / "wifi-scripts"
+        / "files"
+        / "lib"
+        / "wifi"
+        / "mac80211.uc"
+    )
+    wireless.parent.mkdir(parents=True)
+    wireless.write_text(
+        "set ${si}.ssid='${defaults?.ssid || 'OpenWrt'}'\n"
+        "set ${si}.key='${defaults?.key || 'password8'}'\n",
+        encoding="utf-8",
+    )
+    flash = (
+        project
+        / "feeds"
+        / "luci"
+        / "modules"
+        / "luci-mod-system"
+        / "htdocs"
+        / "flash.js"
+    )
+    flash.parent.mkdir(parents=True)
+    flash.write_text(
+        "ui.awaitReconnect(window.location.host, '192.168.1.1', 'openwrt.lan');\n",
+        encoding="utf-8",
+    )
 
 
 class BuildWorkflowTests(unittest.TestCase):
+    def test_unmanaged_settings_package_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project_dir = root / "project"
+            prepare_build_tree(root, project_dir)
+            settings = project_dir / "package" / "custom" / "settings"
+            settings.mkdir(parents=True)
+            (settings / "Makefile").write_text("PKG_NAME:=other-package\n", encoding="ascii")
+            project = ProjectSpec(
+                "fixture", "https://github.com/example/fixture.git", "main", project_dir
+            )
+            workflow = Workflow(root)
+            with self.assertRaisesRegex(WorkflowError, "已被其他内容占用"):
+                workflow._write_metadata_package(
+                    project,
+                    BuildSpec(
+                        platform="x86_64",
+                        devices=("generic",),
+                        hostname="OWRT",
+                        ip_address="192.168.1.1",
+                        wifi_ssid="OWRT",
+                        wifi_password="password8",
+                        backup_enabled=False,
+                    ),
+                )
+
     def test_custom_script_build_id_and_custom_log_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -225,13 +289,47 @@ all:
             self.assertEqual(load_build_config(metadata).hostname, spec.hostname)
             latest_metadata = project_dir / ".builder" / BUILD_SETTINGS_FILE
             self.assertEqual(latest_metadata.stat().st_mode & 0o777, 0o600)
-            settings = project_dir / "package" / "custom" / "settings" / "files" / "etc" / "uci-defaults" / "99-builder-settings"
-            self.assertTrue(settings.is_file())
+            settings = (
+                project_dir
+                / "package"
+                / "custom"
+                / "settings"
+                / "files"
+                / "etc"
+                / "uci-defaults"
+                / "99-builder-settings"
+            )
+            self.assertFalse(settings.exists())
             settings_makefile = project_dir / "package" / "custom" / "settings" / "Makefile"
-            self.assertIn("define Build/Compile\nendef", settings_makefile.read_text(encoding="utf-8"))
+            settings_makefile_text = settings_makefile.read_text(encoding="utf-8")
+            self.assertIn("define Build/Compile\nendef", settings_makefile_text)
+            self.assertIn("TITLE:=OpenWrt Builder metadata", settings_makefile_text)
+            self.assertNotIn("uci-defaults", settings_makefile_text)
+            self.assertTrue((settings_makefile.parent / ".owrt-tool-managed").is_file())
+            config_generate = (
+                project_dir / "package" / "base-files" / "files" / "bin" / "config_generate"
+            ).read_text(encoding="utf-8")
+            self.assertIn('${ipaddr:-"192.168.8.1"}', config_generate)
+            self.assertIn(".hostname='fixture'", config_generate)
+            wireless = (
+                project_dir
+                / "package"
+                / "network"
+                / "config"
+                / "wifi-scripts"
+                / "files"
+                / "lib"
+                / "wifi"
+                / "mac80211.uc"
+            ).read_text(encoding="utf-8")
+            self.assertIn(".ssid='fixture-wifi'", wireless)
+            self.assertIn(".key='fixture-password'", wireless)
+            flash = next(project_dir.rglob("flash.js")).read_text(encoding="utf-8")
+            self.assertIn("'192.168.8.1'", flash)
             build_log = next((root / "logs").glob("log-x86_64-*.txt")).read_text(
                 encoding="utf-8"
             )
+            self.assertIn("已直接修改主机名和 LAN IP", build_log)
             self.assertIn("WiFi 密码：fixture-password", build_log)
             self.assertIn("常规配置：2 行；SHA256：", build_log)
             self.assertNotIn("[输入] 常规配置：CONFIG_PACKAGE", build_log)

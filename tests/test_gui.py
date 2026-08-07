@@ -4,13 +4,14 @@ import os
 from pathlib import Path
 import tempfile
 import time
+from typing import Callable, cast
 import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QLineEdit, QMessageBox, QPushButton
 
 from core import __version__
 from core.configuration import ImportedBuildConfig
@@ -25,7 +26,7 @@ class GuiStateTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def test_version_backup_gate_and_plugin_rows(self) -> None:
-        self.assertEqual(__version__, "4.1")
+        self.assertEqual(__version__, "5.0")
         window = MainWindow(Path.cwd())
         window.startup_timer.stop()
         window.resize(900, 720)
@@ -48,13 +49,15 @@ class GuiStateTests(unittest.TestCase):
             self.assertEqual(defaults_window.hostname_edit.text(), "OWRT")
             self.assertEqual(defaults_window.wifi_ssid_edit.text(), "OWRT")
             defaults_window.close()
-        self.assertFalse(window.project_page.isEnabled())
+        project_page = window.project_page
+        assert project_page is not None
+        self.assertFalse(project_page.isEnabled())
         self.assertFalse(window.repository_edit.isEnabled())
         self.assertFalse(window.branch_edit.isEnabled())
         self.assertFalse(window.clone_button.isEnabled())
         window.report = EnvironmentReport((EnvironmentCheck("依赖", True, "ok"),))
         window._set_workflow_enabled()
-        self.assertTrue(window.project_page.isEnabled())
+        self.assertTrue(project_page.isEnabled())
         self.assertTrue(window.repository_edit.isEnabled())
         window.tabs.setCurrentIndex(1)
         self.application.processEvents()
@@ -124,10 +127,13 @@ class GuiStateTests(unittest.TestCase):
         window.backup_retention_edit.setText("3")
         window.report = EnvironmentReport((EnvironmentCheck("依赖", False, "missing"),))
         window._set_workflow_enabled()
-        self.assertFalse(window.project_page.isEnabled())
+        self.assertFalse(project_page.isEnabled())
         self.assertFalse(window.repository_edit.isEnabled())
-        self.assertEqual(window.plugin_table.horizontalHeaderItem(3).text(), "操作")
-        self.assertEqual(window.prebuilt_table.horizontalHeaderItem(3).text(), "操作")
+        plugin_header = window.plugin_table.horizontalHeaderItem(3)
+        prebuilt_header = window.prebuilt_table.horizontalHeaderItem(3)
+        assert plugin_header is not None and prebuilt_header is not None
+        self.assertEqual(plugin_header.text(), "操作")
+        self.assertEqual(prebuilt_header.text(), "操作")
         field_labels = {
             "已有项目",
             "项目地址",
@@ -152,21 +158,24 @@ class GuiStateTests(unittest.TestCase):
         ):
             window.add_plugin()
         self.assertEqual(window.plugin_table.rowCount(), 1)
-        self.assertEqual(
-            window.plugin_table.item(0, 2).text(),
-            "axonhub luci-app-axonhub",
-        )
+        first_plugin_item = window.plugin_table.item(0, 2)
+        assert first_plugin_item is not None
+        self.assertEqual(first_plugin_item.text(), "axonhub luci-app-axonhub")
         window.plugin_repository_edit.setText("https://github.com/example/packages.git")
         window.plugin_names_edit.setText("luci-app-two")
         window.add_plugin()
         self.assertEqual(window.plugin_table.rowCount(), 2)
-        self.assertEqual(window.plugin_table.item(1, 2).text(), "luci-app-two")
-        remove_button = window.plugin_table.cellWidget(0, 3)
+        second_plugin_item = window.plugin_table.item(1, 2)
+        assert second_plugin_item is not None
+        self.assertEqual(second_plugin_item.text(), "luci-app-two")
+        remove_button = cast(QPushButton, window.plugin_table.cellWidget(0, 3))
         self.assertTrue(remove_button.text())
         self.assertFalse(remove_button.icon().isNull())
         self.assertEqual(remove_button.height(), window.CONTROL_HEIGHT)
         self.application.processEvents()
-        header = window.plugin_table.horizontalHeaderItem(3).text()
+        header_item = window.plugin_table.horizontalHeaderItem(3)
+        assert header_item is not None
+        header = header_item.text()
         required_width = window.plugin_table.fontMetrics().horizontalAdvance(header) + 24
         self.assertGreaterEqual(window.plugin_table.columnWidth(3), required_width)
         self.assertEqual(
@@ -223,18 +232,19 @@ class GuiStateTests(unittest.TestCase):
             window.environment_sizer.refresh()
             for column in (0, 1):
                 self.assertGreaterEqual(window.environment_table.columnWidth(column), 104)
-                self.assertEqual(
-                    window.environment_table.horizontalHeaderItem(column).textAlignment(),
-                    Qt.AlignmentFlag.AlignCenter,
-                )
+                header_item = window.environment_table.horizontalHeaderItem(column)
+                assert header_item is not None
+                self.assertEqual(header_item.textAlignment(), Qt.AlignmentFlag.AlignCenter)
             for row in range(2):
                 for column in (0, 1):
-                    self.assertEqual(
-                        window.environment_table.item(row, column).textAlignment(),
-                        Qt.AlignmentFlag.AlignCenter,
-                    )
-            self.assertEqual(window.environment_table.item(0, 1).foreground().color().name(), "#15803d")
-            self.assertEqual(window.environment_table.item(1, 1).foreground().color().name(), "#c62828")
+                    item = window.environment_table.item(row, column)
+                    assert item is not None
+                    self.assertEqual(item.textAlignment(), Qt.AlignmentFlag.AlignCenter)
+            passed_item = window.environment_table.item(0, 1)
+            failed_item = window.environment_table.item(1, 1)
+            assert passed_item is not None and failed_item is not None
+            self.assertEqual(passed_item.foreground().color().name(), "#15803d")
+            self.assertEqual(failed_item.foreground().color().name(), "#c62828")
             window.report = EnvironmentReport((EnvironmentCheck("依赖", True, "ok"),))
             window._set_workflow_enabled()
 
@@ -269,7 +279,7 @@ class GuiStateTests(unittest.TestCase):
         def fail_job(
             _log: object,
             _step: object,
-            final: object,
+            final: Callable[[], None],
             _cancelled: object,
         ) -> None:
             final()
@@ -320,7 +330,9 @@ class GuiStateTests(unittest.TestCase):
         self.assertEqual(window.wifi_password_edit.text(), "password 123")
         self.assertEqual(window.extra_config_edit.toPlainText(), "CONFIG_PACKAGE_htop=y\n")
         self.assertEqual(window.plugin_table.rowCount(), 1)
-        self.assertEqual(window.plugin_table.item(0, 2).text(), "luci-app-example")
+        item = window.plugin_table.item(0, 2)
+        assert item is not None
+        self.assertEqual(item.text(), "luci-app-example")
         self.assertFalse(window.backup_checkbox.isChecked())
         self.assertEqual(window.backup_retention_edit.text(), "7")
         self.assertEqual(window.backup_directory_edit.text(), "/tmp/firmware")

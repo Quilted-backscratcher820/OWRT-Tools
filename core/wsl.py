@@ -46,7 +46,7 @@ def windows_path_entries(path_value: str | None = None) -> tuple[str, ...]:
 
 def _append_windows_path_value(content: str) -> str | None:
     parser = ConfigParser(interpolation=None, strict=False)
-    parser.optionxform = str.lower
+    parser.optionxform = lambda optionstr: optionstr.lower()
     try:
         parser.read_string(content or "")
     except ConfigParserError as exc:

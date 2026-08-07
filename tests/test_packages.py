@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 
 from core.models import BuildSpec, ProjectSpec
 from core.packages import PrebuiltPackageError, package_sha256, stage_prebuilt_package, verify_staged_package
-from core.workflow import Workflow
+from core.workflow import Workflow, WorkflowError
 
 
 class PrebuiltPackageTests(unittest.TestCase):
@@ -34,6 +35,14 @@ class PrebuiltPackageTests(unittest.TestCase):
             source.write_bytes(b"data")
             with self.assertRaisesRegex(PrebuiltPackageError, "只支持"):
                 stage_prebuilt_package(source, root / "staged")
+            package = root / "package.ipk"
+            package.write_bytes(b"data")
+            real_staging = root / "real-staging"
+            real_staging.mkdir()
+            linked_staging = root / "linked-staging"
+            linked_staging.symlink_to(real_staging, target_is_directory=True)
+            with self.assertRaisesRegex(PrebuiltPackageError, "暂存目录不能是符号链接"):
+                stage_prebuilt_package(package, linked_staging)
 
     def test_generated_wrapper_contains_data_only_extractors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -74,3 +83,11 @@ class PrebuiltPackageTests(unittest.TestCase):
                 / package.filename
             )
             self.assertTrue(staged_copy.is_file())
+            with self.assertRaisesRegex(WorkflowError, "校验失败"):
+                workflow._write_prebuilt_package(
+                    project,
+                    replace(spec, prebuilt_packages=(replace(package, sha256="0" * 64),)),
+                )
+            self.assertTrue(
+                (project_dir / "package" / "custom" / "builder-prebuilt" / "Makefile").is_file()
+            )

@@ -110,10 +110,15 @@ def validate_build_spec(spec: BuildSpec) -> BuildSpec:
         raise ValidationError("WiFi 名称不能为空，且不能包含换行或空字节。")
     if not spec.wifi_password.strip() or len(spec.wifi_password) < 8 or "\n" in spec.wifi_password or "\x00" in spec.wifi_password:
         raise ValidationError("WiFi 密码至少需要 8 个字符，且不能包含换行或空字节。")
-    if spec.backup_retention < 1:
-        raise ValidationError("固件备份留存数至少为 1。")
+    if not 1 <= spec.backup_retention <= 100:
+        raise ValidationError("固件备份留存数必须是 1-100 的整数。")
+    plugin_package_names: set[str] = set()
     for plugin in spec.plugins:
         validate_plugin_spec(plugin)
+        for package_name in plugin.package_names:
+            if package_name in plugin_package_names:
+                raise ValidationError(f"插件名不能跨项目重复：{package_name}")
+            plugin_package_names.add(package_name)
     package_names: set[str] = set()
     package_digests: set[str] = set()
     for package in spec.prebuilt_packages:

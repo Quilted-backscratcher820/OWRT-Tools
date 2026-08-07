@@ -101,6 +101,23 @@ class ValidationTests(unittest.TestCase):
         validate_build_spec(
             valid_spec(extra_config='CONFIG_EXTRA_OPTIMIZATION="-fno-caller-saves -fno-plt"\n')
         )
+        with self.assertRaisesRegex(ValidationError, "不能跨项目重复"):
+            validate_build_spec(
+                valid_spec(
+                    plugins=(
+                        PluginSpec(
+                            "https://github.com/example/one.git",
+                            "main",
+                            ("luci-app-example",),
+                        ),
+                        PluginSpec(
+                            "https://github.com/example/two.git",
+                            "main",
+                            ("luci-app-example",),
+                        ),
+                    )
+                )
+            )
 
     def test_managed_selectors_override_conflicting_extra_config(self) -> None:
         config = build_config_text(
